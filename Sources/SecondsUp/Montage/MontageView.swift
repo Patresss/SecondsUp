@@ -145,10 +145,16 @@ struct MontageView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     titleSection
+                        .disabled(effectsDisabled)
+                        .opacity(effectsDisabled ? 0.55 : 1)
                     Divider()
                     captionSection
+                        .disabled(effectsDisabled)
+                        .opacity(effectsDisabled ? 0.55 : 1)
                     Divider()
                     musicSection
+                        .disabled(effectsDisabled)
+                        .opacity(effectsDisabled ? 0.55 : 1)
                     Divider()
                     outputSection
                 }
@@ -162,18 +168,50 @@ struct MontageView: View {
         }
     }
 
+    private var effectsDisabled: Bool {
+        model.settings.renderMode == .losslessCopy
+    }
+
     private var preview: some View {
-        ZStack {
-            if let clip = model.selectedClip {
-                previewOverlay(caption: model.formattedCaption(for: clip))
-            } else {
-                VStack(spacing: 10) {
-                    Image(systemName: "photo.on.rectangle")
-                        .font(.system(size: 32))
-                        .foregroundStyle(.secondary)
-                    Text("Podglad klipu z napisem")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button(action: model.startSelectedClipPreview) {
+                    Label("Klip", systemImage: "play.rectangle")
+                }
+                .disabled(model.selectedClip == nil)
+
+                Button(action: model.startMoviePreview) {
+                    Label("Caly film", systemImage: "film.stack")
+                }
+                .disabled(model.includedClips.isEmpty)
+
+                Button(action: model.restartPreview) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Uruchom podglad od poczatku")
+
+                Spacer()
+
+                Text(model.previewMode.label)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(nsColor: .windowBackgroundColor))
+
+            ZStack {
+                if model.previewMode == .movie || model.selectedClip != nil {
+                    previewOverlay(caption: model.previewCaption)
+                } else {
+                    VStack(spacing: 10) {
+                        Image(systemName: "photo.on.rectangle")
+                            .font(.system(size: 32))
+                            .foregroundStyle(.secondary)
+                        Text("Podglad klipu z napisem")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -186,8 +224,9 @@ struct MontageView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 if model.settings.captionEnabled {
+                    let fontSize = max(10, model.settings.captionFontSize * proxy.size.height / 1080)
                     Text(caption)
-                        .font(.system(size: max(10, model.settings.captionFontSize * proxy.size.height / 1080)))
+                        .font(.custom(model.settings.captionFont.label, size: fontSize))
                         .foregroundStyle(.white.opacity(model.settings.captionOpacity))
                         .shadow(color: .black.opacity(0.7), radius: 1, x: 1, y: 1)
                         .padding(14)
@@ -232,6 +271,25 @@ struct MontageView: View {
                 }
                 .font(.callout)
             }
+
+            Toggle("Plansza koncowa", isOn: $model.settings.endCardEnabled)
+                .font(.headline)
+                .padding(.top, model.settings.titleEnabled ? 6 : 0)
+
+            if model.settings.endCardEnabled {
+                TextField("Tekst koncowy, np. Koniec", text: $model.settings.endCardText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 420)
+
+                HStack {
+                    Text("Czas trwania")
+                    Slider(value: $model.settings.endCardDuration, in: 1...5, step: 0.5)
+                        .frame(maxWidth: 220)
+                    Text(String(format: "%.1fs", model.settings.endCardDuration))
+                        .monospacedDigit()
+                }
+                .font(.callout)
+            }
         }
     }
 
@@ -255,6 +313,13 @@ struct MontageView: View {
                         }
                     }
                     .frame(maxWidth: 240)
+
+                    Picker("Font", selection: $model.settings.captionFont) {
+                        ForEach(CaptionFont.allCases) { font in
+                            Text(font.label).tag(font)
+                        }
+                    }
+                    .frame(maxWidth: 220)
                 }
                 .font(.callout)
 
@@ -345,12 +410,21 @@ struct MontageView: View {
                 .font(.headline)
 
             HStack(spacing: 16) {
+                Picker("Tryb", selection: $model.settings.renderMode) {
+                    ForEach(MontageRenderMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .frame(maxWidth: 230)
+                .help(model.settings.renderMode.help)
+
                 Picker("Rozdzielczosc", selection: $model.settings.resolution) {
                     ForEach(ResolutionPreset.allCases) { preset in
                         Text(preset.label).tag(preset)
                     }
                 }
                 .frame(maxWidth: 300)
+                .disabled(model.settings.renderMode == .losslessCopy)
 
                 Picker("FPS", selection: $model.settings.fps) {
                     ForEach([24, 25, 30, 60], id: \.self) { value in
@@ -358,16 +432,31 @@ struct MontageView: View {
                     }
                 }
                 .frame(maxWidth: 120)
+                .disabled(model.settings.renderMode == .losslessCopy)
 
-                Picker("Jakosc", selection: $model.settings.renderQuality) {
-                    ForEach(RenderQuality.allCases) { quality in
-                        Text(quality.label).tag(quality)
+                if model.settings.renderMode == .h264 {
+                    Picker("Jakosc", selection: $model.settings.renderQuality) {
+                        ForEach(RenderQuality.allCases) { quality in
+                            Text(quality.label).tag(quality)
+                        }
                     }
+                    .frame(maxWidth: 200)
+                    .help("Szybka: krotszy czas renderu. Najlepsza: mniejsze artefakty, wolniejszy render.")
                 }
-                .frame(maxWidth: 200)
-                .help("Szybka: krotszy czas renderu. Najlepsza: mniejsze artefakty, wolniejszy render.")
             }
             .font(.callout)
+
+            Text(model.settings.renderMode.help)
+                .font(.caption)
+                .foregroundStyle(model.settings.renderMode == .losslessCopy ? .orange : .secondary)
+                .lineLimit(2)
+
+            if model.settings.renderMode == .losslessCopy {
+                Label("Napisy, plansze i muzyka wymagaja renderowania obrazu. Uzyj ProRes HQ, jesli chcesz zachowac bardzo wysoka jakosc z tymi dodatkami.", systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 

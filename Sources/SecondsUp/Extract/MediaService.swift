@@ -236,6 +236,30 @@ struct MediaService: Sendable {
                     try? FileManager.default.removeItem(at: output)
                 }
             }
+            if let expectedFrames {
+                do {
+                    try exportLosslessByFrameMux(
+                        ffmpegURL: ffmpegURL,
+                        source: source,
+                        output: output,
+                        keyframe: keyframe,
+                        expectedFrames: expectedFrames
+                    )
+                    let validation = try validateClip(
+                        output,
+                        expectedFrames: expectedFrames,
+                        method: .lossless
+                    )
+                    if validation.isValid {
+                        return (output, .lossless)
+                    }
+                    lastFailure = validation.summary(expectedFrames: expectedFrames)
+                    try? FileManager.default.removeItem(at: output)
+                } catch {
+                    lastFailure = error.localizedDescription
+                    try? FileManager.default.removeItem(at: output)
+                }
+            }
             throw MediaError.invalidExport(lastFailure ?? "nieznany blad eksportu bezstratnego")
         } else {
             let arguments = [
@@ -306,6 +330,104 @@ struct MediaService: Sendable {
         ] + commonOutput
 
         return [outputSeek, inputSeek]
+    }
+
+    private func exportLosslessByFrameMux(
+        ffmpegURL: URL,
+        source: URL,
+        output: URL,
+        keyframe: Double,
+        expectedFrames: Int
+    ) throws {
+        let tempFolder = output
+            .deletingLastPathComponent()
+            .appendingPathComponent(".secondsup-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempFolder, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempFolder)
+        }
+
+        let videoOnly = tempFolder.appendingPathComponent("video.mov")
+        let audioOnly = tempFolder.appendingPathComponent("audio.m4a")
+        let start = String(format: "%.3f", keyframe)
+
+        try FFmpegRunner.run(
+            ffmpegURL,
+            [
+                "-hide_banner",
+                "-loglevel", "error",
+                "-nostdin",
+                "-ss", start,
+                "-i", source.path,
+                "-frames:v", "\(expectedFrames)",
+                "-map", "0:v:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-c:v", "copy",
+                "-map_metadata", "0",
+                "-avoid_negative_ts", "make_zero",
+                videoOnly.path
+            ]
+        )
+
+        let hasAudio: Bool
+        do {
+            try FFmpegRunner.run(
+                ffmpegURL,
+                [
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-nostdin",
+                    "-ss", start,
+                    "-i", source.path,
+                    "-t", "1.000",
+                    "-vn",
+                    "-map", "0:a:0?",
+                    "-c:a", "copy",
+                    "-avoid_negative_ts", "make_zero",
+                    audioOnly.path
+                ]
+            )
+            let audioSize = (try? audioOnly.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            hasAudio = audioSize > 0
+        } catch {
+            hasAudio = false
+        }
+
+        try? FileManager.default.removeItem(at: output)
+        if hasAudio {
+            try FFmpegRunner.run(
+                ffmpegURL,
+                [
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-nostdin",
+                    "-i", videoOnly.path,
+                    "-i", audioOnly.path,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c", "copy",
+                    "-shortest",
+                    "-avoid_negative_ts", "make_zero",
+                    output.path
+                ]
+            )
+        } else {
+            try FFmpegRunner.run(
+                ffmpegURL,
+                [
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-nostdin",
+                    "-i", videoOnly.path,
+                    "-map", "0:v:0",
+                    "-c:v", "copy",
+                    "-avoid_negative_ts", "make_zero",
+                    output.path
+                ]
+            )
+        }
     }
 
     func nextOutputURL(dateText: String, in outputFolder: URL) -> URL {

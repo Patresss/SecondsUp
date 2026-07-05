@@ -8,8 +8,6 @@ final class MontageRenderer: @unchecked Sendable {
     private var cancelled = false
     private var currentProcess: Process?
 
-    private static let fontPath = "/System/Library/Fonts/Helvetica.ttc"
-
     init(tools: ToolSet) {
         self.tools = tools
     }
@@ -43,6 +41,15 @@ final class MontageRenderer: @unchecked Sendable {
             throw MediaError.emptyRender
         }
 
+        if settings.renderMode == .losslessCopy {
+            return try renderLosslessCopy(
+                ffmpegURL: ffmpegURL,
+                clips: clips.map(\.url),
+                output: output,
+                onProgress: onProgress
+            )
+        }
+
         let workDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("SecondsUp-render-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
@@ -56,10 +63,12 @@ final class MontageRenderer: @unchecked Sendable {
         // Plansza tytulowa.
         if settings.titleEnabled && !settings.titleText.isEmpty {
             onProgress(RenderProgress(stage: "Plansza tytulowa", fraction: 0.02))
-            let titleURL = workDir.appendingPathComponent("title.mp4")
-            try renderTitleCard(
+            let titleURL = workDir.appendingPathComponent("title.\(settings.segmentExtension)")
+            try renderCard(
                 ffmpegURL: ffmpegURL,
                 to: titleURL,
+                text: settings.titleText,
+                duration: settings.titleDuration,
                 settings: settings,
                 width: width,
                 height: height
@@ -78,7 +87,9 @@ final class MontageRenderer: @unchecked Sendable {
                 )
             )
             expectedClipsDuration += (try? probeDuration(of: clip.url)) ?? 1.0
-            let segmentURL = workDir.appendingPathComponent(String(format: "seg_%04d.mp4", index))
+            let segmentURL = workDir.appendingPathComponent(
+                String(format: "seg_%04d.%@", index, settings.segmentExtension)
+            )
             try normalizeClip(
                 ffmpegURL: ffmpegURL,
                 source: clip.url,
@@ -91,10 +102,26 @@ final class MontageRenderer: @unchecked Sendable {
             segments.append(segmentURL)
         }
 
+        if settings.endCardEnabled && !settings.endCardText.isEmpty {
+            try checkCancelled()
+            onProgress(RenderProgress(stage: "Plansza koncowa", fraction: 0.73))
+            let endURL = workDir.appendingPathComponent("end.\(settings.segmentExtension)")
+            try renderCard(
+                ffmpegURL: ffmpegURL,
+                to: endURL,
+                text: settings.endCardText,
+                duration: settings.endCardDuration,
+                settings: settings,
+                width: width,
+                height: height
+            )
+            segments.append(endURL)
+        }
+
         // Concat.
         try checkCancelled()
         onProgress(RenderProgress(stage: "Sklejanie klipow", fraction: 0.75))
-        let concatURL = workDir.appendingPathComponent("concat.mp4")
+        let concatURL = workDir.appendingPathComponent("concat.\(settings.segmentExtension)")
         try concatenate(ffmpegURL: ffmpegURL, segments: segments, to: concatURL, workDir: workDir)
 
         // Muzyka.
@@ -103,7 +130,7 @@ final class MontageRenderer: @unchecked Sendable {
         if let musicPath = settings.musicPath,
            FileManager.default.fileExists(atPath: musicPath) {
             onProgress(RenderProgress(stage: "Dodaje muzyke", fraction: 0.88))
-            let musicURL = workDir.appendingPathComponent("final.mp4")
+            let musicURL = workDir.appendingPathComponent("final.\(settings.segmentExtension)")
             try addMusic(
                 ffmpegURL: ffmpegURL,
                 video: concatURL,
@@ -123,6 +150,9 @@ final class MontageRenderer: @unchecked Sendable {
         if settings.titleEnabled && !settings.titleText.isEmpty {
             expected += settings.titleDuration
         }
+        if settings.endCardEnabled && !settings.endCardText.isEmpty {
+            expected += settings.endCardDuration
+        }
         let actual = try probeDuration(of: renderedURL)
         let tolerance = max(1.0, expected * 0.03)
         guard abs(actual - expected) <= tolerance else {
@@ -140,6 +170,43 @@ final class MontageRenderer: @unchecked Sendable {
     }
 
     // MARK: - Etapy
+
+    private func renderLosslessCopy(
+        ffmpegURL: URL,
+        clips: [URL],
+        output: URL,
+        onProgress: @escaping @Sendable (RenderProgress) -> Void
+    ) throws -> URL {
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SecondsUp-copy-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: workDir)
+        }
+
+        try checkCancelled()
+        onProgress(RenderProgress(stage: "Sklejanie bezstratne", fraction: 0.2))
+        if FileManager.default.fileExists(atPath: output.path) {
+            try FileManager.default.removeItem(at: output)
+        }
+        try concatenate(ffmpegURL: ffmpegURL, segments: clips, to: output, workDir: workDir)
+
+        try checkCancelled()
+        onProgress(RenderProgress(stage: "Walidacja", fraction: 0.9))
+        let expected = clips.reduce(0.0) { total, clip in
+            total + ((try? probeDuration(of: clip)) ?? 1.0)
+        }
+        let actual = try probeDuration(of: output)
+        let tolerance = max(1.0, expected * 0.05)
+        guard abs(actual - expected) <= tolerance else {
+            throw MediaError.invalidExport(
+                String(format: "czas %.1fs, oczekiwano ~%.1fs", actual, expected)
+            )
+        }
+
+        onProgress(RenderProgress(stage: "Gotowe", fraction: 1.0))
+        return output
+    }
 
     private func normalizeClip(
         ffmpegURL: URL,
@@ -192,27 +259,24 @@ final class MontageRenderer: @unchecked Sendable {
             arguments += ["-an"]
         }
 
-        arguments += [
-            "-c:v", "libx264",
-            "-preset", settings.renderQuality.preset,
-            "-crf", settings.renderQuality.crf,
-            "-pix_fmt", "yuv420p",
-            output.path
-        ]
+        arguments += videoEncodingArguments(settings: settings)
+        arguments += [output.path]
 
         try run(ffmpegURL, arguments)
     }
 
-    private func renderTitleCard(
+    private func renderCard(
         ffmpegURL: URL,
         to output: URL,
+        text: String,
+        duration: Double,
         settings: MontageSettings,
         width: Int,
         height: Int
     ) throws {
         let fontSize = min(width, height) / 12
-        let title = Self.escapeDrawtext(settings.titleText)
-        let drawtext = "drawtext=fontfile=\(Self.fontPath):text='\(title)'"
+        let title = Self.escapeDrawtext(text)
+        let drawtext = "drawtext=fontfile=\(settings.captionFont.fontPath):text='\(title)'"
             + ":fontsize=\(fontSize):fontcolor=white:x=(w-tw)/2:y=(h-th)/2"
 
         var arguments = [
@@ -226,20 +290,15 @@ final class MontageRenderer: @unchecked Sendable {
             arguments += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
         }
         arguments += [
-            "-t", String(format: "%.2f", settings.titleDuration),
+            "-t", String(format: "%.2f", duration),
             "-vf", drawtext,
             "-map", "0:v"
         ]
         if settings.keepClipAudio {
             arguments += ["-map", "1:a", "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k"]
         }
-        arguments += [
-            "-c:v", "libx264",
-            "-preset", settings.renderQuality.preset,
-            "-crf", settings.renderQuality.crf,
-            "-pix_fmt", "yuv420p",
-            output.path
-        ]
+        arguments += videoEncodingArguments(settings: settings)
+        arguments += [output.path]
 
         try run(ffmpegURL, arguments)
     }
@@ -323,11 +382,29 @@ final class MontageRenderer: @unchecked Sendable {
     private func captionFilter(text: String, settings: MontageSettings) -> String {
         let escaped = Self.escapeDrawtext(text)
         let position = settings.captionPosition.drawtextXY
-        return "drawtext=fontfile=\(Self.fontPath):text='\(escaped)'"
+        return "drawtext=fontfile=\(settings.captionFont.fontPath):text='\(escaped)'"
             + String(format: ":fontsize=%.0f", settings.captionFontSize)
             + String(format: ":fontcolor=white@%.2f", settings.captionOpacity)
             + ":borderw=2:bordercolor=black@0.6"
             + ":x=\(position.x):y=\(position.y)"
+    }
+
+    private func videoEncodingArguments(settings: MontageSettings) -> [String] {
+        switch settings.renderMode {
+        case .h264, .losslessCopy:
+            return [
+                "-c:v", "libx264",
+                "-preset", settings.renderQuality.preset,
+                "-crf", settings.renderQuality.crf,
+                "-pix_fmt", "yuv420p"
+            ]
+        case .proResHQ:
+            return [
+                "-c:v", "prores_ks",
+                "-profile:v", "3",
+                "-pix_fmt", "yuv422p10le"
+            ]
+        }
     }
 
     static func escapeDrawtext(_ text: String) -> String {
@@ -422,5 +499,11 @@ final class MontageRenderer: @unchecked Sendable {
             }
             throw error
         }
+    }
+}
+
+private extension MontageSettings {
+    var segmentExtension: String {
+        renderMode == .proResHQ ? "mov" : "mp4"
     }
 }

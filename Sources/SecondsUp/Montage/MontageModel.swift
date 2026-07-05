@@ -3,6 +3,22 @@ import AVFoundation
 import Foundation
 import UniformTypeIdentifiers
 
+enum MontagePreviewMode: String, CaseIterable, Identifiable {
+    case clip
+    case movie
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .clip:
+            return "Klip"
+        case .movie:
+            return "Caly film"
+        }
+    }
+}
+
 @MainActor
 final class MontageModel: ObservableObject {
     @Published var folder: URL?
@@ -14,10 +30,13 @@ final class MontageModel: ObservableObject {
     @Published var progress: RenderProgress?
     @Published var statusMessage = ""
     @Published var lastOutput: URL?
+    @Published var previewMode: MontagePreviewMode = .clip
+    @Published var previewCaption = ""
 
     /// Podglad wybranego klipu odtwarzany w petli.
     let previewPlayer = AVQueuePlayer()
     private var previewLooper: AVPlayerLooper?
+    private var previewTimeObserver: Any?
 
     private let tools: ToolSet
     private var renderer: MontageRenderer?
@@ -25,6 +44,7 @@ final class MontageModel: ObservableObject {
     private var suppressProjectSave = false
 
     private static let folderKey = "montage.folder"
+    private static let quickTimeMovieType = UTType(filenameExtension: "mov") ?? .movie
 
     init(tools: ToolSet = .detect()) {
         self.tools = tools
@@ -56,6 +76,9 @@ final class MontageModel: ObservableObject {
         if settings.titleEnabled && !settings.titleText.isEmpty {
             total += settings.titleDuration
         }
+        if settings.endCardEnabled && !settings.endCardText.isEmpty {
+            total += settings.endCardDuration
+        }
         let minutes = Int(total) / 60
         let seconds = Int(total) % 60
         return String(format: "%d:%02d", minutes, seconds)
@@ -84,10 +107,20 @@ final class MontageModel: ObservableObject {
             return dateText
         case .dayMonth:
             return displayFormatter(template: "d.MM").string(from: date)
+        case .dayMonthPadded:
+            return displayFormatter(template: "dd.MM").string(from: date)
+        case .dayMonthYearDots:
+            return displayFormatter(template: "dd.MM.yyyy").string(from: date)
+        case .slash:
+            return displayFormatter(template: "dd/MM/yyyy").string(from: date)
         case .dayMonthLong:
             return displayFormatter(template: "d MMMM").string(from: date)
         case .dayMonthYearLong:
             return displayFormatter(template: "d MMMM yyyy").string(from: date)
+        case .weekdayShort:
+            return displayFormatter(template: "E, d.MM").string(from: date)
+        case .weekdayLong:
+            return displayFormatter(template: "EEEE, d MMMM").string(from: date)
         }
     }
 
@@ -102,6 +135,7 @@ final class MontageModel: ObservableObject {
     private static func displayFormatter(template: String) -> DateFormatter {
         let formatter = DateFormatter()
         formatter.dateFormat = template
+        formatter.locale = Locale(identifier: "pl_PL")
         formatter.timeZone = TimeZone(identifier: "UTC")
         return formatter
     }
@@ -184,14 +218,53 @@ final class MontageModel: ObservableObject {
     /// Wybiera klip i odtwarza go w petli w podgladzie.
     func selectClip(_ id: URL?) {
         selectedClipID = id
-        previewLooper = nil
-        previewPlayer.removeAllItems()
-        guard let id else {
+        guard previewMode == .clip else {
             return
         }
-        let item = AVPlayerItem(url: id)
+        startSelectedClipPreview()
+    }
+
+    func startSelectedClipPreview() {
+        previewMode = .clip
+        removePreviewObserver()
+        previewLooper = nil
+        previewPlayer.removeAllItems()
+        guard let selectedClip else {
+            return
+        }
+        previewCaption = formattedCaption(for: selectedClip)
+        let item = AVPlayerItem(url: selectedClip.url)
         previewLooper = AVPlayerLooper(player: previewPlayer, templateItem: item)
         previewPlayer.play()
+    }
+
+    func startMoviePreview() {
+        let included = includedClips
+        guard !included.isEmpty else {
+            statusMessage = "Brak zaznaczonych klipow do podgladu."
+            return
+        }
+
+        previewMode = .movie
+        previewLooper = nil
+        removePreviewObserver()
+        previewPlayer.removeAllItems()
+        for clip in included {
+            previewPlayer.insert(AVPlayerItem(url: clip.url), after: nil)
+        }
+        previewCaption = formattedCaption(for: included[0])
+        startPreviewObserver()
+        previewPlayer.play()
+        statusMessage = "Podglad calego filmu: \(included.count) klipow"
+    }
+
+    func restartPreview() {
+        switch previewMode {
+        case .clip:
+            startSelectedClipPreview()
+        case .movie:
+            startMoviePreview()
+        }
     }
 
     private func applySavedOrder(to clips: inout [MontageClip], order: [String], excluded: [String]) {
@@ -328,8 +401,13 @@ final class MontageModel: ObservableObject {
         }
 
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.mpeg4Movie]
-        panel.nameFieldStringValue = "OneSecondEveryday.mp4"
+        if settings.renderMode == .losslessCopy || settings.renderMode == .proResHQ {
+            panel.allowedContentTypes = [Self.quickTimeMovieType]
+            panel.nameFieldStringValue = "OneSecondEveryday.mov"
+        } else {
+            panel.allowedContentTypes = [.mpeg4Movie]
+            panel.nameFieldStringValue = "OneSecondEveryday.mp4"
+        }
         if let folder {
             panel.directoryURL = folder.deletingLastPathComponent()
         }
@@ -392,5 +470,36 @@ final class MontageModel: ObservableObject {
 
     func revealClip(_ url: URL) {
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func startPreviewObserver() {
+        previewTimeObserver = previewPlayer.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.2, preferredTimescale: 600),
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.previewMode == .movie,
+                      let currentURL = self.currentPreviewURL(),
+                      let clip = self.clips.first(where: { $0.url == currentURL }) else {
+                    return
+                }
+                self.previewCaption = self.formattedCaption(for: clip)
+            }
+        }
+    }
+
+    private func removePreviewObserver() {
+        if let previewTimeObserver {
+            previewPlayer.removeTimeObserver(previewTimeObserver)
+            self.previewTimeObserver = nil
+        }
+    }
+
+    private func currentPreviewURL() -> URL? {
+        guard let asset = previewPlayer.currentItem?.asset as? AVURLAsset else {
+            return nil
+        }
+        return asset.url
     }
 }

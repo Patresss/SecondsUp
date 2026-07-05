@@ -33,10 +33,18 @@ Skroty: `←`/`→` klatka, `⇧←`/`⇧→` ±0.5 s, `spacja` podglad 1 s,
 1. Wybierz folder z wycietymi sekundami (podpowiadany jest folder eksportu).
 2. Klipy sortuja sie chronologicznie po dacie z nazwy pliku; checkbox
    wlacza/wylacza klip, kolejnosc zmieniasz przeciaganiem.
-3. Opcje: plansza tytulowa, **napis z data z nazwy pliku** (np. `2026-06-05.mov`
-   → `2026-06-05`, domyslnie prawy dolny rog), muzyka z regulacja glosnosci
-   i fade-out, zachowanie dzwieku klipow, rozdzielczosc (4K/1080p/720p/kwadrat/pion) i fps.
-4. `Renderuj film`: normalizacja klipow → napisy → concat → muzyka → walidacja,
+3. Podglad moze odtwarzac pojedynczy klip albo caly film z aktualna kolejnoscia
+   i podgladowym napisem daty.
+4. Opcje: plansza tytulowa i koncowa, **napis z data z nazwy pliku** w wielu
+   formatach, wybor fontu, muzyka z regulacja glosnosci i fade-out, zachowanie
+   dzwieku klipow, rozdzielczosc (4K/1080p/720p/kwadrat/pion) i fps.
+5. Tryby renderu:
+   - `H.264`: uniwersalny MP4, obraz jest renderowany ponownie;
+   - `ProRes HQ`: bardzo wysoka jakosc do archiwum lub dalszego montazu,
+     z napisami, planszami i muzyka;
+   - `Bezstratnie copy`: prawdziwe sklejanie bez rekompresji, ale bez napisow,
+     plansz, muzyki, zmiany rozdzielczosci i zmiany fps.
+6. `Renderuj film`: normalizacja klipow → napisy → concat → muzyka → walidacja,
    z paskiem postepu i mozliwoscia przerwania.
 
 Ustawienia projektu (kolejnosc, wykluczenia, muzyka, ...) zapisuja sie w

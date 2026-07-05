@@ -101,8 +101,13 @@ enum CaptionFormat: String, Codable, CaseIterable, Identifiable {
     case raw
     case iso
     case dayMonth
+    case dayMonthPadded
+    case dayMonthYearDots
+    case slash
     case dayMonthLong
     case dayMonthYearLong
+    case weekdayShort
+    case weekdayLong
 
     var id: String { rawValue }
 
@@ -114,10 +119,105 @@ enum CaptionFormat: String, Codable, CaseIterable, Identifiable {
             return "2026-06-05"
         case .dayMonth:
             return "5.06"
+        case .dayMonthPadded:
+            return "05.06"
+        case .dayMonthYearDots:
+            return "05.06.2026"
+        case .slash:
+            return "05/06/2026"
         case .dayMonthLong:
             return "5 czerwca"
         case .dayMonthYearLong:
             return "5 czerwca 2026"
+        case .weekdayShort:
+            return "pt, 5.06"
+        case .weekdayLong:
+            return "piatek, 5 czerwca"
+        }
+    }
+}
+
+enum CaptionFont: String, Codable, CaseIterable, Identifiable {
+    case helvetica
+    case helveticaNeue
+    case avenir
+    case avenirNext
+    case menlo
+    case georgia
+    case times
+    case arialRounded
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .helvetica:
+            return "Helvetica"
+        case .helveticaNeue:
+            return "Helvetica Neue"
+        case .avenir:
+            return "Avenir"
+        case .avenirNext:
+            return "Avenir Next"
+        case .menlo:
+            return "Menlo"
+        case .georgia:
+            return "Georgia"
+        case .times:
+            return "Times"
+        case .arialRounded:
+            return "Arial Rounded"
+        }
+    }
+
+    var fontPath: String {
+        switch self {
+        case .helvetica:
+            return "/System/Library/Fonts/Helvetica.ttc"
+        case .helveticaNeue:
+            return "/System/Library/Fonts/HelveticaNeue.ttc"
+        case .avenir:
+            return "/System/Library/Fonts/Avenir.ttc"
+        case .avenirNext:
+            return "/System/Library/Fonts/Avenir Next.ttc"
+        case .menlo:
+            return "/System/Library/Fonts/Menlo.ttc"
+        case .georgia:
+            return "/System/Library/Fonts/Supplemental/Georgia.ttf"
+        case .times:
+            return "/System/Library/Fonts/Times.ttc"
+        case .arialRounded:
+            return "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf"
+        }
+    }
+}
+
+enum MontageRenderMode: String, Codable, CaseIterable, Identifiable {
+    case h264
+    case proResHQ
+    case losslessCopy
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .h264:
+            return "H.264"
+        case .proResHQ:
+            return "ProRes HQ"
+        case .losslessCopy:
+            return "Bezstratnie copy"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .h264:
+            return "Uniwersalny plik MP4. Obraz jest renderowany ponownie."
+        case .proResHQ:
+            return "Bardzo wysoka jakosc do archiwum lub dalszego montazu. Pliki beda duze."
+        case .losslessCopy:
+            return "Kopiuje klipy bez rekompresji. Pomija napisy, plansze, muzyke, zmiane FPS i rozdzielczosci."
         }
     }
 }
@@ -168,9 +268,14 @@ struct MontageSettings: Codable, Equatable {
     var titleText = ""
     var titleDuration = 2.0
 
+    var endCardEnabled = false
+    var endCardText = ""
+    var endCardDuration = 2.0
+
     var captionEnabled = true
     var captionPosition: CaptionPosition = .bottomRight
     var captionFormat: CaptionFormat = .raw
+    var captionFont: CaptionFont = .helvetica
     var captionFontSize = 36.0
     var captionOpacity = 0.9
 
@@ -184,6 +289,7 @@ struct MontageSettings: Codable, Equatable {
     var resolution: ResolutionPreset = .p1080
     var fps = 30
     var renderQuality: RenderQuality = .standard
+    var renderMode: MontageRenderMode = .h264
 
     /// Kolejnosc (nazwy plikow) i wykluczenia zapisane w projekcie.
     var order: [String] = []
@@ -199,9 +305,13 @@ struct MontageSettings: Codable, Equatable {
         titleEnabled = try container.decodeIfPresent(Bool.self, forKey: .titleEnabled) ?? defaults.titleEnabled
         titleText = try container.decodeIfPresent(String.self, forKey: .titleText) ?? defaults.titleText
         titleDuration = try container.decodeIfPresent(Double.self, forKey: .titleDuration) ?? defaults.titleDuration
+        endCardEnabled = try container.decodeIfPresent(Bool.self, forKey: .endCardEnabled) ?? defaults.endCardEnabled
+        endCardText = try container.decodeIfPresent(String.self, forKey: .endCardText) ?? defaults.endCardText
+        endCardDuration = try container.decodeIfPresent(Double.self, forKey: .endCardDuration) ?? defaults.endCardDuration
         captionEnabled = try container.decodeIfPresent(Bool.self, forKey: .captionEnabled) ?? defaults.captionEnabled
         captionPosition = try container.decodeIfPresent(CaptionPosition.self, forKey: .captionPosition) ?? defaults.captionPosition
         captionFormat = try container.decodeIfPresent(CaptionFormat.self, forKey: .captionFormat) ?? defaults.captionFormat
+        captionFont = try container.decodeIfPresent(CaptionFont.self, forKey: .captionFont) ?? defaults.captionFont
         captionFontSize = try container.decodeIfPresent(Double.self, forKey: .captionFontSize) ?? defaults.captionFontSize
         captionOpacity = try container.decodeIfPresent(Double.self, forKey: .captionOpacity) ?? defaults.captionOpacity
         musicPath = try container.decodeIfPresent(String.self, forKey: .musicPath)
@@ -213,6 +323,7 @@ struct MontageSettings: Codable, Equatable {
         resolution = try container.decodeIfPresent(ResolutionPreset.self, forKey: .resolution) ?? defaults.resolution
         fps = try container.decodeIfPresent(Int.self, forKey: .fps) ?? defaults.fps
         renderQuality = try container.decodeIfPresent(RenderQuality.self, forKey: .renderQuality) ?? defaults.renderQuality
+        renderMode = try container.decodeIfPresent(MontageRenderMode.self, forKey: .renderMode) ?? defaults.renderMode
         order = try container.decodeIfPresent([String].self, forKey: .order) ?? []
         excluded = try container.decodeIfPresent([String].self, forKey: .excluded) ?? []
     }
