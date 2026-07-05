@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 /// Renderer montazu: normalizacja klipow + napis daty -> plansza tytulowa ->
@@ -7,6 +8,7 @@ final class MontageRenderer: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
     private var currentProcess: Process?
+    var currentExport: AVAssetExportSession?
 
     init(tools: ToolSet) {
         self.tools = tools
@@ -16,8 +18,10 @@ final class MontageRenderer: @unchecked Sendable {
         lock.lock()
         cancelled = true
         let process = currentProcess
+        let export = currentExport
         lock.unlock()
         process?.terminate()
+        export?.cancelExport()
     }
 
     private var isCancelled: Bool {
@@ -43,6 +47,15 @@ final class MontageRenderer: @unchecked Sendable {
 
         if settings.renderMode == .losslessCopy {
             return try renderLosslessCopy(
+                ffmpegURL: ffmpegURL,
+                clips: clips.map(\.url),
+                output: output,
+                onProgress: onProgress
+            )
+        }
+
+        if settings.renderMode == .losslessSmart {
+            return try renderLosslessSmart(
                 ffmpegURL: ffmpegURL,
                 clips: clips.map(\.url),
                 output: output,
@@ -215,16 +228,349 @@ final class MontageRenderer: @unchecked Sendable {
         return output
     }
 
+    /// Smart concat: klipy zgodne z najczestsza sygnatura sa kopiowane
+    /// bez rekompresji, tylko odstajace sa dopasowywane re-encode'em.
+    private func renderLosslessSmart(
+        ffmpegURL: URL,
+        clips: [URL],
+        output: URL,
+        onProgress: @escaping @Sendable (RenderProgress) -> Void
+    ) throws -> URL {
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SecondsUp-smart-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: workDir)
+        }
+
+        // 1. Sygnatury wszystkich klipow.
+        onProgress(RenderProgress(stage: "Analiza parametrow klipow", fraction: 0.02))
+        var entries: [(url: URL, video: VideoSignature, audio: AudioSignature)] = []
+        for clip in clips {
+            try checkCancelled()
+            entries.append((
+                clip,
+                try probeVideoSignature(of: clip),
+                (try? probeAudioSignature(of: clip)) ?? .none
+            ))
+        }
+
+        // 2. Najczestsza kombinacja video+audio jako wzorzec.
+        var counts: [String: Int] = [:]
+        for entry in entries {
+            counts["\(entry.video.summary)|\(entry.audio.summary)", default: 0] += 1
+        }
+        guard let majorityKey = counts.max(by: { $0.value < $1.value })?.key,
+              let reference = entries.first(where: {
+                  "\($0.video.summary)|\($0.audio.summary)" == majorityKey
+              }) else {
+            throw MediaError.emptyRender
+        }
+
+        // 3. Odstajace klipy dopasowujemy do wzorca, reszta idzie bez zmian.
+        var segments: [URL] = []
+        let outliers = entries.filter {
+            "\($0.video.summary)|\($0.audio.summary)" != majorityKey
+        }
+        var conformedCount = 0
+        for (index, entry) in entries.enumerated() {
+            try checkCancelled()
+            if "\(entry.video.summary)|\(entry.audio.summary)" == majorityKey {
+                segments.append(entry.url)
+                continue
+            }
+            conformedCount += 1
+            onProgress(
+                RenderProgress(
+                    stage: "Dopasowuje \(conformedCount)/\(outliers.count): \(entry.url.lastPathComponent)",
+                    fraction: 0.05 + 0.75 * Double(conformedCount) / Double(max(1, outliers.count))
+                )
+            )
+            let conformedURL = workDir.appendingPathComponent(String(format: "conf_%04d.mov", index))
+            try conformClip(
+                ffmpegURL: ffmpegURL,
+                source: entry.url,
+                sourceSignature: entry.video,
+                sourceAudio: entry.audio,
+                target: reference.video,
+                targetAudio: reference.audio,
+                to: conformedURL
+            )
+            segments.append(conformedURL)
+        }
+
+        // 4. Sklejanie przez AVFoundation passthrough (bez rekompresji).
+        // Kazdy segment zachowuje wlasne parametry kodeka (multi-stsd w MOV),
+        // wiec granice miedzy klipami z roznych enkoderow dekoduja sie czysto —
+        // sklejka ffmpeg -c copy zapisuje jeden globalny naglowek i psuje
+        // segmenty z innym SPS/PPS.
+        try checkCancelled()
+        onProgress(RenderProgress(stage: "Sklejanie bezstratne", fraction: 0.85))
+        if FileManager.default.fileExists(atPath: output.path) {
+            try FileManager.default.removeItem(at: output)
+        }
+        try concatenatePassthrough(segments: segments, to: output, onProgress: onProgress)
+
+        try checkCancelled()
+        onProgress(RenderProgress(stage: "Walidacja", fraction: 0.97))
+        let expected = clips.reduce(0.0) { total, clip in
+            total + ((try? probeDuration(of: clip)) ?? 1.0)
+        }
+        let actual = try probeDuration(of: output)
+        let tolerance = max(1.0, expected * 0.05)
+        guard abs(actual - expected) <= tolerance else {
+            throw MediaError.invalidExport(
+                String(format: "czas %.1fs, oczekiwano ~%.1fs", actual, expected)
+            )
+        }
+
+        onProgress(RenderProgress(stage: "Gotowe", fraction: 1.0))
+        return output
+    }
+
+    /// Bezstratne sklejanie przez AVMutableComposition + eksport passthrough.
+    private func concatenatePassthrough(
+        segments: [URL],
+        to output: URL,
+        onProgress: @escaping @Sendable (RenderProgress) -> Void
+    ) throws {
+        let composition = AVMutableComposition()
+        guard let videoTrack = composition.addMutableTrack(
+            withMediaType: .video,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            throw MediaError.invalidExport("nie mozna utworzyc sciezki video")
+        }
+        let audioTrack = composition.addMutableTrack(
+            withMediaType: .audio,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        )
+
+        var cursor = CMTime.zero
+        for segment in segments {
+            try checkCancelled()
+            let asset = AVURLAsset(url: segment)
+            let duration = asset.duration
+            guard let sourceVideo = asset.tracks(withMediaType: .video).first else {
+                throw MediaError.invalidExport("brak video w \(segment.lastPathComponent)")
+            }
+            let range = CMTimeRange(start: .zero, duration: duration)
+            do {
+                try videoTrack.insertTimeRange(range, of: sourceVideo, at: cursor)
+            } catch {
+                throw MediaError.invalidExport(
+                    "nie mozna dolaczyc \(segment.lastPathComponent): \(error.localizedDescription)"
+                )
+            }
+            if let audioTrack {
+                if let sourceAudio = asset.tracks(withMediaType: .audio).first {
+                    try? audioTrack.insertTimeRange(range, of: sourceAudio, at: cursor)
+                } else {
+                    // Cisza zamiast dzwieku, zeby audio nie rozjechalo sie z obrazem.
+                    audioTrack.insertEmptyTimeRange(CMTimeRange(start: cursor, duration: duration))
+                }
+            }
+            cursor = CMTimeAdd(cursor, duration)
+        }
+
+        guard let export = AVAssetExportSession(
+            asset: composition,
+            presetName: AVAssetExportPresetPassthrough
+        ) else {
+            throw MediaError.invalidExport("passthrough eksport niedostepny")
+        }
+        export.outputURL = output
+        export.outputFileType = .mov
+
+        lock.lock()
+        currentExport = export
+        lock.unlock()
+        defer {
+            lock.lock()
+            currentExport = nil
+            lock.unlock()
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        export.exportAsynchronously {
+            semaphore.signal()
+        }
+        while semaphore.wait(timeout: .now() + 0.25) == .timedOut {
+            onProgress(
+                RenderProgress(
+                    stage: "Sklejanie bezstratne",
+                    fraction: 0.85 + 0.11 * Double(export.progress)
+                )
+            )
+        }
+
+        switch export.status {
+        case .completed:
+            return
+        case .cancelled:
+            throw MediaError.cancelled
+        default:
+            throw MediaError.invalidExport(
+                export.error?.localizedDescription ?? "eksport passthrough nie powiodl sie"
+            )
+        }
+    }
+
+    /// Re-encode pojedynczego klipu do parametrow wzorca (kodek, rozdzielczosc,
+    /// pix_fmt, kolor, audio), zeby dal sie bezpiecznie skleic -c copy.
+    private func conformClip(
+        ffmpegURL: URL,
+        source: URL,
+        sourceSignature: VideoSignature,
+        sourceAudio: AudioSignature,
+        target: VideoSignature,
+        targetAudio: AudioSignature,
+        to output: URL
+    ) throws {
+        var filters = [
+            "scale=\(target.width):\(target.height):force_original_aspect_ratio=decrease",
+            "pad=\(target.width):\(target.height):(ow-iw)/2:(oh-ih)/2",
+            "setsar=1"
+        ]
+
+        // Konwersja przestrzeni barw (np. SDR bt709 -> HDR HLG bt2020).
+        if !target.colorTransfer.isEmpty,
+           sourceSignature.colorTransfer != target.colorTransfer,
+           let zscale = Self.zscaleFilter(from: sourceSignature, to: target) {
+            filters.append(zscale)
+        }
+        if !target.pixelFormat.isEmpty {
+            filters.append("format=\(target.pixelFormat)")
+        }
+
+        var arguments = [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-i", source.path
+        ]
+
+        let needsSilence = targetAudio.hasAudio && !sourceAudio.hasAudio
+        if needsSilence {
+            let layout = targetAudio.channels >= 2 ? "stereo" : "mono"
+            arguments += [
+                "-f", "lavfi",
+                "-i", "anullsrc=r=\(targetAudio.sampleRate):cl=\(layout)"
+            ]
+        }
+
+        arguments += [
+            "-vf", filters.joined(separator: ","),
+            "-map", "0:v:0"
+        ]
+
+        if targetAudio.hasAudio {
+            if sourceAudio.hasAudio {
+                arguments += ["-map", "0:a:0"]
+            } else {
+                arguments += ["-map", "1:a:0", "-shortest"]
+            }
+            arguments += [
+                "-c:a", "aac",
+                "-ar", "\(targetAudio.sampleRate)",
+                "-ac", "\(targetAudio.channels)",
+                "-b:a", "256k"
+            ]
+        } else {
+            arguments += ["-an"]
+        }
+
+        // Kodek video wzorca.
+        if target.codec == "hevc" {
+            arguments += [
+                "-c:v", "libx265",
+                "-preset", "medium",
+                "-crf", "14",
+                "-tag:v", "hvc1"
+            ]
+        } else {
+            arguments += [
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "14"
+            ]
+        }
+
+        // Metadane kolorow w kontenerze/VUI zgodne ze wzorcem.
+        if !target.colorPrimaries.isEmpty {
+            arguments += ["-color_primaries", target.colorPrimaries]
+        }
+        if !target.colorTransfer.isEmpty {
+            arguments += ["-color_trc", target.colorTransfer]
+        }
+        if !target.colorSpace.isEmpty {
+            arguments += ["-colorspace", target.colorSpace]
+        }
+
+        arguments.append(output.path)
+        try run(ffmpegURL, arguments)
+    }
+
+    /// Filtr zscale konwertujacy kolory zrodla do wzorca. Zwraca nil,
+    /// gdy nie umiemy zmapowac nazw — wtedy zostaje samo przetagowanie.
+    static func zscaleFilter(from source: VideoSignature, to target: VideoSignature) -> String? {
+        func transferName(_ value: String) -> String? {
+            switch value {
+            case "bt709": return "709"
+            case "arib-std-b67": return "arib-std-b67"
+            case "smpte2084": return "smpte2084"
+            case "smpte170m", "bt601": return "601"
+            default: return nil
+            }
+        }
+        func primariesName(_ value: String) -> String? {
+            switch value {
+            case "bt709": return "709"
+            case "bt2020": return "2020"
+            case "smpte170m": return "170m"
+            default: return nil
+            }
+        }
+        func matrixName(_ value: String) -> String? {
+            switch value {
+            case "bt709": return "709"
+            case "bt2020nc": return "2020_ncl"
+            case "smpte170m": return "170m"
+            case "bt470bg": return "470bg"
+            default: return nil
+            }
+        }
+
+        guard let targetTransfer = transferName(target.colorTransfer),
+              let targetPrimaries = primariesName(target.colorPrimaries),
+              let targetMatrix = matrixName(target.colorSpace) else {
+            return nil
+        }
+
+        var filter = "zscale=t=\(targetTransfer):p=\(targetPrimaries):m=\(targetMatrix)"
+        if let sourceTransfer = transferName(source.colorTransfer),
+           let sourcePrimaries = primariesName(source.colorPrimaries),
+           let sourceMatrix = matrixName(source.colorSpace) {
+            filter += ":tin=\(sourceTransfer):pin=\(sourcePrimaries):min=\(sourceMatrix)"
+        }
+        return filter
+    }
+
     /// Sygnatura parametrow strumienia video istotnych dla sklejania -c copy.
-    private struct VideoSignature: Equatable {
+    struct VideoSignature: Equatable {
         let codec: String
         let width: Int
         let height: Int
         let pixelFormat: String
         let colorTransfer: String
+        let colorPrimaries: String
+        let colorSpace: String
 
         var summary: String {
             var text = "\(codec) \(width)x\(height)"
+            if !pixelFormat.isEmpty {
+                text += " \(pixelFormat)"
+            }
             if !colorTransfer.isEmpty {
                 text += " \(colorTransfer)"
             }
@@ -232,7 +578,24 @@ final class MontageRenderer: @unchecked Sendable {
         }
     }
 
-    private func probeVideoSignature(of url: URL) throws -> VideoSignature {
+    /// Sygnatura audio: przy -c copy rozne parametry audio tez psuja sklejke.
+    struct AudioSignature: Equatable {
+        let codec: String
+        let sampleRate: Int
+        let channels: Int
+
+        static let none = AudioSignature(codec: "brak", sampleRate: 0, channels: 0)
+
+        var hasAudio: Bool {
+            self != .none
+        }
+
+        var summary: String {
+            hasAudio ? "\(codec) \(sampleRate)Hz \(channels)ch" : "brak audio"
+        }
+    }
+
+    func probeVideoSignature(of url: URL) throws -> VideoSignature {
         guard let ffprobeURL = tools.ffprobeURL else {
             throw MediaError.toolMissing("ffprobe")
         }
@@ -241,7 +604,8 @@ final class MontageRenderer: @unchecked Sendable {
             [
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,width,height,pix_fmt,color_transfer",
+                "-show_entries",
+                "stream=codec_name,width,height,pix_fmt,color_transfer,color_primaries,color_space",
                 "-of", "json",
                 url.path
             ]
@@ -253,6 +617,8 @@ final class MontageRenderer: @unchecked Sendable {
                 let height: Int?
                 let pixFmt: String?
                 let colorTransfer: String?
+                let colorPrimaries: String?
+                let colorSpace: String?
 
                 enum CodingKeys: String, CodingKey {
                     case codecName = "codec_name"
@@ -260,6 +626,8 @@ final class MontageRenderer: @unchecked Sendable {
                     case height
                     case pixFmt = "pix_fmt"
                     case colorTransfer = "color_transfer"
+                    case colorPrimaries = "color_primaries"
+                    case colorSpace = "color_space"
                 }
             }
             let streams: [Stream]
@@ -273,7 +641,48 @@ final class MontageRenderer: @unchecked Sendable {
             width: stream.width ?? 0,
             height: stream.height ?? 0,
             pixelFormat: stream.pixFmt ?? "",
-            colorTransfer: stream.colorTransfer ?? ""
+            colorTransfer: stream.colorTransfer ?? "",
+            colorPrimaries: stream.colorPrimaries ?? "",
+            colorSpace: stream.colorSpace ?? ""
+        )
+    }
+
+    func probeAudioSignature(of url: URL) throws -> AudioSignature {
+        guard let ffprobeURL = tools.ffprobeURL else {
+            throw MediaError.toolMissing("ffprobe")
+        }
+        let data = try FFmpegRunner.run(
+            ffprobeURL,
+            [
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name,sample_rate,channels",
+                "-of", "json",
+                url.path
+            ]
+        )
+        struct Probe: Decodable {
+            struct Stream: Decodable {
+                let codecName: String?
+                let sampleRate: String?
+                let channels: Int?
+
+                enum CodingKeys: String, CodingKey {
+                    case codecName = "codec_name"
+                    case sampleRate = "sample_rate"
+                    case channels
+                }
+            }
+            let streams: [Stream]
+        }
+        let probe = try JSONDecoder().decode(Probe.self, from: data)
+        guard let stream = probe.streams.first else {
+            return .none
+        }
+        return AudioSignature(
+            codec: stream.codecName ?? "?",
+            sampleRate: stream.sampleRate.flatMap(Int.init) ?? 0,
+            channels: stream.channels ?? 0
         )
     }
 
@@ -489,7 +898,7 @@ final class MontageRenderer: @unchecked Sendable {
 
     private func videoEncodingArguments(settings: MontageSettings) -> [String] {
         switch settings.renderMode {
-        case .h264, .losslessCopy:
+        case .h264, .losslessSmart, .losslessCopy:
             return [
                 "-c:v", "libx264",
                 "-preset", settings.renderQuality.preset,

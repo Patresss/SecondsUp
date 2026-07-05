@@ -74,7 +74,7 @@ enum SelfTest {
             if let mode = try? value(after: "--mode", in: arguments),
                let renderMode = MontageRenderMode(rawValue: mode) {
                 settings.renderMode = renderMode
-                if renderMode == .losslessCopy {
+                if renderMode.isLossless {
                     settings.titleEnabled = false
                 }
             }

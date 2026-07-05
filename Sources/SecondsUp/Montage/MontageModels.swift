@@ -195,6 +195,7 @@ enum CaptionFont: String, Codable, CaseIterable, Identifiable {
 enum MontageRenderMode: String, Codable, CaseIterable, Identifiable {
     case h264
     case proResHQ
+    case losslessSmart
     case losslessCopy
 
     var id: String { rawValue }
@@ -205,6 +206,8 @@ enum MontageRenderMode: String, Codable, CaseIterable, Identifiable {
             return "H.264"
         case .proResHQ:
             return "ProRes HQ"
+        case .losslessSmart:
+            return "Bezstratnie smart"
         case .losslessCopy:
             return "Bezstratnie copy"
         }
@@ -216,9 +219,19 @@ enum MontageRenderMode: String, Codable, CaseIterable, Identifiable {
             return "Uniwersalny plik MP4. Obraz jest renderowany ponownie."
         case .proResHQ:
             return "Bardzo wysoka jakosc do archiwum lub dalszego montazu. Pliki beda duze."
+        case .losslessSmart:
+            return "Klipy zgodne z wiekszoscia sa kopiowane bez rekompresji; "
+                + "tylko odstajace (inny kodek/rozdzielczosc/kolor) sa dopasowywane. "
+                + "Pomija napisy, plansze, muzyke."
         case .losslessCopy:
-            return "Kopiuje klipy bez rekompresji. Pomija napisy, plansze, muzyke, zmiane FPS i rozdzielczosci."
+            return "Kopiuje klipy bez rekompresji. Wymaga identycznych parametrow wszystkich klipow. "
+                + "Pomija napisy, plansze, muzyke, zmiane FPS i rozdzielczosci."
         }
+    }
+
+    /// Tryby bezstratne pomijaja napisy/plansze/muzyke.
+    var isLossless: Bool {
+        self == .losslessSmart || self == .losslessCopy
     }
 }
 

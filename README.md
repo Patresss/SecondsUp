@@ -42,6 +42,11 @@ Skroty: `←`/`→` klatka, `⇧←`/`⇧→` ±0.5 s, `spacja` podglad 1 s,
    - `H.264`: uniwersalny MP4, obraz jest renderowany ponownie;
    - `ProRes HQ`: bardzo wysoka jakosc do archiwum lub dalszego montazu,
      z napisami, planszami i muzyka;
+   - `Bezstratnie smart`: klipy zgodne z najczestsza sygnatura (kodek,
+     rozdzielczosc, pix_fmt, kolor, audio) sa kopiowane bit-w-bit; tylko
+     odstajace sa dopasowywane re-encode'em (libx265/libx264 CRF 14,
+     konwersja kolorow zscale, audio do spec wzorca). Idealne, gdy np.
+     kilka klipow z calego roku ma inna rozdzielczosc.
    - `Bezstratnie copy`: prawdziwe sklejanie bez rekompresji, ale bez napisow,
      plansz, muzyki, zmiany rozdzielczosci i zmiany fps. Wymaga identycznych
      parametrow wszystkich klipow (kodek, rozdzielczosc, kolor) — aplikacja

@@ -169,7 +169,7 @@ struct MontageView: View {
     }
 
     private var effectsDisabled: Bool {
-        model.settings.renderMode == .losslessCopy
+        model.settings.renderMode.isLossless
     }
 
     private var preview: some View {
@@ -424,7 +424,7 @@ struct MontageView: View {
                     }
                 }
                 .frame(maxWidth: 300)
-                .disabled(model.settings.renderMode == .losslessCopy)
+                .disabled(model.settings.renderMode.isLossless)
 
                 Picker("FPS", selection: $model.settings.fps) {
                     ForEach([24, 25, 30, 60], id: \.self) { value in
@@ -432,7 +432,7 @@ struct MontageView: View {
                     }
                 }
                 .frame(maxWidth: 120)
-                .disabled(model.settings.renderMode == .losslessCopy)
+                .disabled(model.settings.renderMode.isLossless)
 
                 if model.settings.renderMode == .h264 {
                     Picker("Jakosc", selection: $model.settings.renderQuality) {
@@ -448,10 +448,10 @@ struct MontageView: View {
 
             Text(model.settings.renderMode.help)
                 .font(.caption)
-                .foregroundStyle(model.settings.renderMode == .losslessCopy ? .orange : .secondary)
-                .lineLimit(2)
+                .foregroundStyle(model.settings.renderMode.isLossless ? .orange : .secondary)
+                .lineLimit(3)
 
-            if model.settings.renderMode == .losslessCopy {
+            if model.settings.renderMode.isLossless {
                 Label("Napisy, plansze i muzyka wymagaja renderowania obrazu. Uzyj ProRes HQ, jesli chcesz zachowac bardzo wysoka jakosc z tymi dodatkami.", systemImage: "info.circle")
                     .font(.caption)
                     .foregroundStyle(.orange)

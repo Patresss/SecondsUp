@@ -401,7 +401,7 @@ final class MontageModel: ObservableObject {
         }
 
         let panel = NSSavePanel()
-        if settings.renderMode == .losslessCopy || settings.renderMode == .proResHQ {
+        if settings.renderMode.isLossless || settings.renderMode == .proResHQ {
             panel.allowedContentTypes = [Self.quickTimeMovieType]
             panel.nameFieldStringValue = "OneSecondEveryday.mov"
         } else {
