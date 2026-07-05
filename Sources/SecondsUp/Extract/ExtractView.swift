@@ -1,7 +1,7 @@
 import SwiftUI
 
-struct ContentView: View {
-    @StateObject private var model = AppModel()
+struct ExtractView: View {
+    @ObservedObject var model: ExtractModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -23,6 +23,12 @@ struct ContentView: View {
                     Label("Folder eksportu", systemImage: "square.and.arrow.down")
                 }
 
+                Button(action: model.exportAllRecommended) {
+                    Label("Eksportuj wszystkie", systemImage: "square.and.arrow.down.on.square")
+                }
+                .disabled(!model.canUseTools || model.isBatchExporting || model.videos.isEmpty)
+                .help("Eksportuje najlepsza sekunde z kazdego filmu wg rekomendacji")
+
                 Spacer()
 
                 Text(model.ffmpegStatus)
@@ -31,6 +37,8 @@ struct ContentView: View {
             }
         }
     }
+
+    // MARK: - Sidebar
 
     private var sidebar: some View {
         VStack(spacing: 0) {
@@ -44,6 +52,12 @@ struct ContentView: View {
                         .lineLimit(1)
                 }
                 Spacer()
+                if !model.videos.isEmpty {
+                    Text("\(model.analyzedCount)/\(model.videos.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("Przeanalizowane filmy")
+                }
             }
             .padding(14)
 
@@ -65,9 +79,9 @@ struct ContentView: View {
                     ForEach(model.videos) { video in
                         VideoRow(
                             video: video,
-                            isLoading: model.isLoadingRecommendation && model.selectedVideoID == video.id
+                            isLoading: video.analysis == nil && video.analysisError == nil
                         )
-                            .tag(video.id as URL?)
+                        .tag(video.id as URL?)
                     }
                 }
                 .listStyle(.sidebar)
@@ -88,6 +102,8 @@ struct ContentView: View {
             .padding(12)
         }
     }
+
+    // MARK: - Panel glowny
 
     private var mainPanel: some View {
         VStack(spacing: 0) {
@@ -114,7 +130,7 @@ struct ContentView: View {
                 PlayerView(player: model.player)
                     .background(Color.black)
 
-                if model.isLoadingRecommendation {
+                if model.isLoadingSelected {
                     LoadingBadge()
                         .padding(16)
                 }
@@ -128,16 +144,6 @@ struct ContentView: View {
 
                 Spacer()
 
-                if model.isLoadingRecommendation {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Licze rekomendacje")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                }
-
                 if let metadata = video.metadata {
                     Text(metadataLine(metadata))
                         .font(.caption)
@@ -150,55 +156,87 @@ struct ContentView: View {
     }
 
     private func controls(video: VideoItem) -> some View {
-        VStack(spacing: 14) {
-            if model.isLoadingRecommendation {
-                RecommendationStatusBanner(kind: .loading)
-            } else if video.recommendation != nil {
-                RecommendationStatusBanner(kind: .ready)
+        VStack(spacing: 12) {
+            if let analysis = video.analysis, !analysis.candidates.isEmpty {
+                candidateStrip(analysis: analysis)
+            } else if let error = video.analysisError {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.yellow)
+                    Text(error)
+                        .font(.caption)
+                    Spacer()
+                }
             }
 
-            RangeTimeline(
+            WaveformTimeline(
+                waveform: video.analysis?.waveform ?? [],
                 duration: video.metadata?.duration ?? 1,
                 start: model.selectedStart,
-                recommendedStart: video.recommendation?.start
+                keyframes: video.analysis?.keyframes ?? [],
+                candidates: video.analysis?.candidates ?? [],
+                onScrub: { model.setStart($0) }
             )
-            .frame(height: 34)
+            .frame(height: 64)
 
             HStack(spacing: 10) {
                 Button(action: model.stepBackward) {
-                    Label("Klatka wstecz", systemImage: "chevron.left")
+                    Label("Klatka", systemImage: "chevron.left")
                 }
+                .keyboardShortcut(.leftArrow, modifiers: [])
                 .disabled(video.metadata == nil)
+                .help("Poprzednia klatka (←), −0.5 s (⇧←)")
 
                 Button(action: model.stepForward) {
-                    Label("Klatka dalej", systemImage: "chevron.right")
+                    Label("Klatka", systemImage: "chevron.right")
                 }
+                .keyboardShortcut(.rightArrow, modifiers: [])
                 .disabled(video.metadata == nil)
+                .help("Nastepna klatka (→), +0.5 s (⇧→)")
+
+                Button(action: model.jumpBackward) {
+                    Image(systemName: "gobackward.5")
+                }
+                .keyboardShortcut(.leftArrow, modifiers: .shift)
+                .disabled(video.metadata == nil)
+                .labelStyle(.iconOnly)
+                .help("−0.5 s (⇧←)")
+
+                Button(action: model.jumpForward) {
+                    Image(systemName: "goforward.5")
+                }
+                .keyboardShortcut(.rightArrow, modifiers: .shift)
+                .disabled(video.metadata == nil)
+                .labelStyle(.iconOnly)
+                .help("+0.5 s (⇧→)")
 
                 Button(action: model.useRecommendation) {
                     Label("Rekomendacja", systemImage: "wand.and.stars")
                 }
-                .disabled(video.recommendation == nil)
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(video.topCandidate == nil)
+                .help("Najlepszy kandydat (⌘R)")
 
                 Button(action: model.playSelectedSecond) {
                     Label("Podglad 1s", systemImage: "play.fill")
                 }
+                .keyboardShortcut(.space, modifiers: [])
                 .disabled(video.metadata == nil)
+                .help("Odtworz zaznaczona sekunde (spacja)")
 
                 Spacer()
 
                 Button(action: model.exportSelectedSecond) {
-                    Label(
-                        exportButtonTitle,
-                        systemImage: "scissors"
-                    )
+                    Label(exportButtonTitle, systemImage: "scissors")
                 }
+                .keyboardShortcut("e", modifiers: .command)
                 .buttonStyle(.borderedProminent)
                 .disabled(!model.exportButtonEnabled || video.metadata == nil)
+                .help("Eksportuj 1 s (⌘E)")
             }
 
             HStack(spacing: 14) {
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text("Start")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -206,36 +244,54 @@ struct ContentView: View {
                         .monospacedDigit()
                 }
 
-                Slider(
-                    value: Binding(
-                        get: { model.selectedStart },
-                        set: { model.setStart($0) }
-                    ),
-                    in: 0...max(0.001, model.maxStart)
-                )
-                .disabled(video.metadata == nil)
-
-                VStack(alignment: .trailing, spacing: 4) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text("Zakres")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text(String(format: "%.3fs-%.3fs", model.selectedStart, model.selectedStart + 1.0))
+                    Text(String(format: "%.3fs - %.3fs", model.selectedStart, model.selectedStart + 1.0))
                         .monospacedDigit()
                 }
-            }
 
-            if let recommendation = video.recommendation {
-                HStack {
-                    Text(String(format: "Rekomendacja %.3fs", recommendation.start))
-                    Text(String(format: "score %.3f", recommendation.score))
-                    Text("\(recommendation.candidateCount) kandydatow")
-                    Spacer()
+                if let method = model.plannedExportMethod {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Ciecie")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(method.label)
+                            .foregroundStyle(method == .lossless ? Color.green : Color.orange)
+                    }
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+
+                Spacer()
+
+                if let top = video.topCandidate {
+                    Text(top.reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
         }
         .padding(16)
+    }
+
+    private func candidateStrip(analysis: AnalysisResult) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Array(analysis.candidates.enumerated()), id: \.element.id) { index, candidate in
+                    CandidateChip(
+                        candidate: candidate,
+                        rank: index + 1,
+                        thumbnail: model.candidateThumbnails[candidate.start],
+                        isSelected: abs(model.selectedStart - candidate.start) < 0.021
+                    )
+                    .onTapGesture {
+                        model.setStart(candidate.start)
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        }
     }
 
     private func metadataLine(_ metadata: VideoMetadata) -> String {
@@ -245,13 +301,68 @@ struct ContentView: View {
     }
 
     private var exportButtonTitle: String {
-        if model.isLoadingRecommendation {
-            return "Czekam na rekomendacje"
-        }
         if model.outputFolder == nil {
             return "Wybierz folder i eksportuj"
         }
         return "Eksportuj 1s"
+    }
+}
+
+// MARK: - Komponenty
+
+private struct CandidateChip: View {
+    let candidate: Candidate
+    let rank: Int
+    let thumbnail: NSImage?
+    let isSelected: Bool
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack(alignment: .topLeading) {
+                Group {
+                    if let thumbnail {
+                        Image(nsImage: thumbnail)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    } else {
+                        Rectangle()
+                            .fill(Color.secondary.opacity(0.15))
+                            .overlay(
+                                ProgressView()
+                                    .controlSize(.small)
+                            )
+                    }
+                }
+                .frame(width: 96, height: 54)
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+
+                Text("\(rank)")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(
+                        rank == 1 ? Color.orange : Color.black.opacity(0.55),
+                        in: RoundedRectangle(cornerRadius: 4)
+                    )
+                    .padding(3)
+            }
+
+            Text(String(format: "%.2fs · %.0f%%", candidate.start, candidate.score * 100))
+                .font(.caption2)
+                .monospacedDigit()
+                .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+        }
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 1.5)
+        )
+        .help(candidate.reason)
     }
 }
 
@@ -280,9 +391,6 @@ private struct VideoRow: View {
                     if let metadata = video.metadata {
                         Text(String(format: "%.0f fps", metadata.fps))
                     }
-                    if isLoading {
-                        Text("licze")
-                    }
                     if !video.exportState.shortText.isEmpty {
                         Text(video.exportState.shortText)
                     }
@@ -297,7 +405,7 @@ private struct VideoRow: View {
     private var iconName: String {
         switch video.exportState {
         case .idle:
-            return video.recommendation == nil ? "film" : "sparkles"
+            return video.analysis == nil ? "film" : "sparkles"
         case .exporting:
             return "arrow.triangle.2.circlepath"
         case .exported:
@@ -310,7 +418,7 @@ private struct VideoRow: View {
     private var iconColor: Color {
         switch video.exportState {
         case .idle:
-            return video.recommendation == nil ? .secondary : .accentColor
+            return video.analysis == nil ? .secondary : .accentColor
         case .exporting:
             return .orange
         case .exported:
@@ -329,7 +437,7 @@ private struct LoadingBadge: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Licze rekomendacje")
                     .font(.caption.weight(.semibold))
-                Text("Start zostanie ustawiony automatycznie")
+                Text("Kandydaci pojawia sie automatycznie")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -341,71 +449,5 @@ private struct LoadingBadge: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.orange.opacity(0.55), lineWidth: 1)
         )
-    }
-}
-
-private enum RecommendationStatusKind: Equatable {
-    case loading
-    case ready
-}
-
-private struct RecommendationStatusBanner: View {
-    let kind: RecommendationStatusKind
-
-    var body: some View {
-        HStack(spacing: 10) {
-            if kind == .loading {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            }
-
-            Text(kind == .loading ? "Aplikacja liczy rekomendowany poczatek sekundy" : "Rekomendowany poczatek jest ustawiony")
-                .font(.caption.weight(.semibold))
-
-            Spacer()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(
-            (kind == .loading ? Color.orange : Color.green)
-                .opacity(0.13),
-            in: RoundedRectangle(cornerRadius: 7)
-        )
-    }
-}
-
-private struct RangeTimeline: View {
-    let duration: Double
-    let start: Double
-    let recommendedStart: Double?
-
-    var body: some View {
-        GeometryReader { proxy in
-            let width = proxy.size.width
-            let safeDuration = max(duration, 1.0)
-            let selectionX = CGFloat(start / safeDuration) * width
-            let selectionWidth = max(4, CGFloat(1.0 / safeDuration) * width)
-            let recommendationX = CGFloat((recommendedStart ?? start) / safeDuration) * width
-
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(Color.secondary.opacity(0.18))
-                    .frame(height: 10)
-
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(Color.accentColor.opacity(0.72))
-                    .frame(width: selectionWidth, height: 14)
-                    .offset(x: min(max(0, selectionX), max(0, width - selectionWidth)))
-
-                Rectangle()
-                    .fill(Color.orange)
-                    .frame(width: 2, height: 26)
-                    .offset(x: min(max(0, recommendationX), max(0, width - 2)))
-            }
-            .frame(maxHeight: .infinity)
-        }
     }
 }

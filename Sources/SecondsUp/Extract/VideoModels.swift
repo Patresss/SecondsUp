@@ -3,7 +3,8 @@ import Foundation
 struct VideoItem: Identifiable, Hashable {
     let url: URL
     var metadata: VideoMetadata?
-    var recommendation: Recommendation?
+    var analysis: AnalysisResult?
+    var analysisError: String?
     var exportState: ExportState = .idle
 
     var id: URL { url }
@@ -15,9 +16,13 @@ struct VideoItem: Identifiable, Hashable {
     var dateString: String? {
         DateParser.dateString(from: fileName)
     }
+
+    var topCandidate: Candidate? {
+        analysis?.candidates.first
+    }
 }
 
-struct VideoMetadata: Sendable, Hashable {
+struct VideoMetadata: Sendable, Hashable, Codable {
     let duration: Double
     let fps: Double
     let frameCount: Int?
@@ -30,11 +35,34 @@ struct VideoMetadata: Sendable, Hashable {
     }
 }
 
-struct Recommendation: Sendable, Hashable {
+/// Wynik pelnej analizy filmu: kandydaci top-N, keyframe'y i waveform audio.
+struct AnalysisResult: Sendable, Hashable, Codable {
+    let candidates: [Candidate]
+    let keyframes: [Double]
+    let waveform: [Float]
+    let sampleCount: Int
+}
+
+struct Candidate: Sendable, Hashable, Codable, Identifiable {
     let start: Double
     let score: Double
     let reason: String
-    let candidateCount: Int
+
+    var id: Double { start }
+}
+
+enum ExportMethod: String, Sendable {
+    case lossless
+    case precise
+
+    var label: String {
+        switch self {
+        case .lossless:
+            return "bezstratnie"
+        case .precise:
+            return "precyzyjnie (re-encode)"
+        }
+    }
 }
 
 enum ExportState: Hashable {
@@ -54,21 +82,6 @@ enum ExportState: Hashable {
         case .failed:
             return "Blad"
         }
-    }
-}
-
-enum DateParser {
-    static func dateString(from text: String) -> String? {
-        let pattern = #"(20\d{2}-\d{2}-\d{2})"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return nil
-        }
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let match = regex.firstMatch(in: text, range: range),
-              let dateRange = Range(match.range(at: 1), in: text) else {
-            return nil
-        }
-        return String(text[dateRange])
     }
 }
 
