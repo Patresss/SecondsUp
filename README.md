@@ -43,7 +43,9 @@ Skroty: `←`/`→` klatka, `⇧←`/`⇧→` ±0.5 s, `spacja` podglad 1 s,
    - `ProRes HQ`: bardzo wysoka jakosc do archiwum lub dalszego montazu,
      z napisami, planszami i muzyka;
    - `Bezstratnie copy`: prawdziwe sklejanie bez rekompresji, ale bez napisow,
-     plansz, muzyki, zmiany rozdzielczosci i zmiany fps.
+     plansz, muzyki, zmiany rozdzielczosci i zmiany fps. Wymaga identycznych
+     parametrow wszystkich klipow (kodek, rozdzielczosc, kolor) — aplikacja
+     sprawdza to przed renderem i wypisuje odstajace pliki.
 6. `Renderuj film`: normalizacja klipow → napisy → concat → muzyka → walidacja,
    z paskiem postepu i mozliwoscia przerwania.
 

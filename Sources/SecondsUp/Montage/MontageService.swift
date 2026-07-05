@@ -184,8 +184,15 @@ final class MontageRenderer: @unchecked Sendable {
             try? FileManager.default.removeItem(at: workDir)
         }
 
+        // Sklejanie -c copy dziala tylko dla identycznych strumieni.
+        // Rozne kodeki/rozdzielczosci/kolory daja zepsute odtwarzanie
+        // na granicach klipow — sprawdzamy to przed renderem.
         try checkCancelled()
-        onProgress(RenderProgress(stage: "Sklejanie bezstratne", fraction: 0.2))
+        onProgress(RenderProgress(stage: "Sprawdzam zgodnosc klipow", fraction: 0.05))
+        try verifyCopyCompatibility(of: clips)
+
+        try checkCancelled()
+        onProgress(RenderProgress(stage: "Sklejanie bezstratne", fraction: 0.4))
         if FileManager.default.fileExists(atPath: output.path) {
             try FileManager.default.removeItem(at: output)
         }
@@ -206,6 +213,97 @@ final class MontageRenderer: @unchecked Sendable {
 
         onProgress(RenderProgress(stage: "Gotowe", fraction: 1.0))
         return output
+    }
+
+    /// Sygnatura parametrow strumienia video istotnych dla sklejania -c copy.
+    private struct VideoSignature: Equatable {
+        let codec: String
+        let width: Int
+        let height: Int
+        let pixelFormat: String
+        let colorTransfer: String
+
+        var summary: String {
+            var text = "\(codec) \(width)x\(height)"
+            if !colorTransfer.isEmpty {
+                text += " \(colorTransfer)"
+            }
+            return text
+        }
+    }
+
+    private func probeVideoSignature(of url: URL) throws -> VideoSignature {
+        guard let ffprobeURL = tools.ffprobeURL else {
+            throw MediaError.toolMissing("ffprobe")
+        }
+        let data = try FFmpegRunner.run(
+            ffprobeURL,
+            [
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,width,height,pix_fmt,color_transfer",
+                "-of", "json",
+                url.path
+            ]
+        )
+        struct Probe: Decodable {
+            struct Stream: Decodable {
+                let codecName: String?
+                let width: Int?
+                let height: Int?
+                let pixFmt: String?
+                let colorTransfer: String?
+
+                enum CodingKeys: String, CodingKey {
+                    case codecName = "codec_name"
+                    case width
+                    case height
+                    case pixFmt = "pix_fmt"
+                    case colorTransfer = "color_transfer"
+                }
+            }
+            let streams: [Stream]
+        }
+        let probe = try JSONDecoder().decode(Probe.self, from: data)
+        guard let stream = probe.streams.first else {
+            throw MediaError.noVideoStream
+        }
+        return VideoSignature(
+            codec: stream.codecName ?? "?",
+            width: stream.width ?? 0,
+            height: stream.height ?? 0,
+            pixelFormat: stream.pixFmt ?? "",
+            colorTransfer: stream.colorTransfer ?? ""
+        )
+    }
+
+    /// Rzuca `incompatibleClips`, jesli klipy nie maja identycznych parametrow.
+    /// Za wzorzec przyjmujemy najczestsza sygnature, w bledzie wypisujemy odstajace pliki.
+    private func verifyCopyCompatibility(of clips: [URL]) throws {
+        var signatures: [(url: URL, signature: VideoSignature)] = []
+        for clip in clips {
+            try checkCancelled()
+            signatures.append((clip, try probeVideoSignature(of: clip)))
+        }
+
+        var counts: [String: Int] = [:]
+        for entry in signatures {
+            counts[entry.signature.summary, default: 0] += 1
+        }
+        guard counts.count > 1 else {
+            return
+        }
+        let majority = counts.max { $0.value < $1.value }?.key
+
+        let outliers = signatures.filter { $0.signature.summary != majority }
+        let maxListed = 6
+        var names = outliers.prefix(maxListed).map {
+            "\($0.url.lastPathComponent) (\($0.signature.summary))"
+        }
+        if outliers.count > maxListed {
+            names.append("… i \(outliers.count - maxListed) innych")
+        }
+        throw MediaError.incompatibleClips(names.joined(separator: ", "))
     }
 
     private func normalizeClip(

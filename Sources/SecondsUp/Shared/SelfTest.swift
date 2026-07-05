@@ -71,6 +71,13 @@ enum SelfTest {
             if let music = try? value(after: "--music", in: arguments) {
                 settings.musicPath = music
             }
+            if let mode = try? value(after: "--mode", in: arguments),
+               let renderMode = MontageRenderMode(rawValue: mode) {
+                settings.renderMode = renderMode
+                if renderMode == .losslessCopy {
+                    settings.titleEnabled = false
+                }
+            }
 
             var clips: [(url: URL, caption: String)] = []
             let contents = try FileManager.default.contentsOfDirectory(

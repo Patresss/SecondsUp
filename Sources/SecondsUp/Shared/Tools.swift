@@ -10,6 +10,7 @@ enum MediaError: LocalizedError {
     case cannotCreateImage
     case cancelled
     case emptyRender
+    case incompatibleClips(String)
 
     var errorDescription: String? {
         switch self {
@@ -31,6 +32,10 @@ enum MediaError: LocalizedError {
             return "Operacja przerwana."
         case .emptyRender:
             return "Brak klipow do zmontowania."
+        case .incompatibleClips(let details):
+            return "Tryb bezstratny wymaga identycznych parametrow wszystkich klipow "
+                + "(kodek, rozdzielczosc, kolor). Odstajace klipy: \(details). "
+                + "Uzyj trybu H.264 albo ProRes, ktory ujednolica klipy."
         }
     }
 }
