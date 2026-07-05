@@ -17,6 +17,17 @@ struct VideoItem: Identifiable, Hashable {
         DateParser.dateString(from: fileName)
     }
 
+    /// Data uzywana do nazwania eksportu: z nazwy pliku,
+    /// a gdy jej brak — z metadanych nagrania.
+    var effectiveDate: String? {
+        dateString ?? metadata?.recordedDate
+    }
+
+    /// Czy data pochodzi z metadanych (a nie z nazwy pliku).
+    var dateFromMetadata: Bool {
+        dateString == nil && metadata?.recordedDate != nil
+    }
+
     var topCandidate: Candidate? {
         analysis?.candidates.first
     }
@@ -29,6 +40,9 @@ struct VideoMetadata: Sendable, Hashable, Codable {
     let codec: String
     let width: Int?
     let height: Int?
+    /// Data nagrania (yyyy-mm-dd) z metadanych pliku — fallback,
+    /// gdy nazwa pliku nie zawiera daty.
+    var recordedDate: String?
 
     var frameStep: Double {
         fps > 0 ? 1.0 / fps : 1.0 / 30.0
@@ -37,10 +51,23 @@ struct VideoMetadata: Sendable, Hashable, Codable {
 
 /// Wynik pelnej analizy filmu: kandydaci top-N, keyframe'y i waveform audio.
 struct AnalysisResult: Sendable, Hashable, Codable {
+    /// Kandydaci precyzyjni — moga zaczynac sie w dowolnym miejscu filmu.
     let candidates: [Candidate]
+    /// Kandydaci bezstratni — zawsze zaczynaja sie na keyframe, wiec da sie
+    /// ich wyeksportowac przez `-c copy` bez przesuwania startu.
+    let losslessCandidates: [Candidate]
     let keyframes: [Double]
     let waveform: [Float]
     let sampleCount: Int
+
+    func candidates(for cutMode: CutMode) -> [Candidate] {
+        switch cutMode {
+        case .losslessOnly:
+            return losslessCandidates.isEmpty ? candidates : losslessCandidates
+        case .autoPrecise:
+            return candidates
+        }
+    }
 }
 
 struct Candidate: Sendable, Hashable, Codable, Identifiable {
@@ -61,6 +88,31 @@ enum ExportMethod: String, Sendable {
             return "bezstratnie"
         case .precise:
             return "precyzyjnie (re-encode)"
+        }
+    }
+}
+
+enum CutMode: String, Codable, CaseIterable, Identifiable {
+    case losslessOnly
+    case autoPrecise
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .losslessOnly:
+            return "Tylko bezstratnie"
+        case .autoPrecise:
+            return "Auto precyzyjnie"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .losslessOnly:
+            return "Rekomenduje i eksportuje tylko sekundy zaczynajace sie na keyframe, bez rekompresji."
+        case .autoPrecise:
+            return "Na keyframe eksportuje bezstratnie, poza keyframe robi krotki re-encode dla dokladnego startu."
         }
     }
 }

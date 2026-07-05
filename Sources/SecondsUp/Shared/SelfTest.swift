@@ -29,6 +29,17 @@ enum SelfTest {
             print("source=\(sourceURL.path)")
             print(String(format: "duration=%.3f fps=%.3f", metadata.duration, metadata.fps))
             print("keyframes=\(analysis.keyframes.count) samples=\(analysis.sampleCount) waveform=\(analysis.waveform.count)")
+            print("lossless candidates:")
+            for (index, candidate) in analysis.losslessCandidates.enumerated() {
+                print(String(
+                    format: "lossless[%d] start=%.3f score=%.3f reason=%@",
+                    index,
+                    candidate.start,
+                    candidate.score,
+                    candidate.reason
+                ))
+            }
+            print("precise candidates:")
             for (index, candidate) in analysis.candidates.enumerated() {
                 print(String(
                     format: "candidate[%d] start=%.3f score=%.3f reason=%@",

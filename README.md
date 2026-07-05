@@ -14,8 +14,11 @@ z muzyka, tytulem i data w rogu.
    (Vision)**, stabilnosc ruchu z kara za ciecia sceny oraz energie dzwieku.
 4. Os czasu z **waveformem audio** — klikasz/przeciagasz po wykresie glosnosci,
    widzac od razu smiech czy mowe; znaczniki pokazuja keyframe'y i kandydatow.
-5. Eksport **smart cut**: start na keyframe → bezstratny `-c copy`;
-   start poza keyframe → precyzyjny re-encode co do klatki (libx264 CRF 16).
+5. Eksport ma jawny **tryb ciecia**:
+   - `Tylko bezstratnie` (domyslnie): rekomendacje sa liczone tylko od keyframe'ow,
+     wiec wybrana sekunda jest realnie eksportowalna przez `-c copy` bez przesuwania startu;
+   - `Auto precyzyjnie`: keyframe → bezstratnie, poza keyframe → krotki re-encode
+     co do klatki (libx264 CRF 16).
    Etykieta przy eksporcie pokazuje, ktory tryb zostanie uzyty.
 6. `Eksportuj wszystkie` robi cala robote wsadowo wg rekomendacji.
 

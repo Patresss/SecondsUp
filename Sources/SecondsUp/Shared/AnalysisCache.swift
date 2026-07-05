@@ -3,7 +3,7 @@ import Foundation
 /// Cache wynikow analizy w ~/Library/Caches/SecondsUp.
 /// Klucz: sciezka pliku; walidacja: rozmiar + data modyfikacji.
 enum AnalysisCache {
-    static let schemaVersion = 2
+    static let schemaVersion = 4
 
     struct Entry: Codable {
         let schemaVersion: Int
@@ -53,6 +53,11 @@ enum AnalysisCache {
         }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try? data.write(to: cacheURL(for: url), options: .atomic)
+    }
+
+    /// Usuwa wpis cache — np. przy recznym przeliczeniu rekomendacji.
+    static func remove(for url: URL) {
+        try? FileManager.default.removeItem(at: cacheURL(for: url))
     }
 
     private static func cacheURL(for url: URL) -> URL {

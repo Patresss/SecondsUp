@@ -54,7 +54,7 @@ struct MediaService: Sendable {
             [
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "format=duration:stream=codec_name,width,height,duration,avg_frame_rate,r_frame_rate,nb_frames",
+                "-show_entries", "format=duration:format_tags=creation_time:stream=codec_name,width,height,duration,avg_frame_rate,r_frame_rate,nb_frames",
                 "-of", "json",
                 url.path
             ]
@@ -78,8 +78,31 @@ struct MediaService: Sendable {
             frameCount: stream.frameCount.flatMap(Int.init),
             codec: stream.codecName ?? "",
             width: stream.width,
-            height: stream.height
+            height: stream.height,
+            recordedDate: Self.recordedDate(fromCreationTime: probe.format?.tags?.creationTime)
+                ?? Self.fileCreationDate(of: url)
         )
+    }
+
+    /// Wyciaga yyyy-mm-dd z taga creation_time (ISO 8601).
+    static func recordedDate(fromCreationTime value: String?) -> String? {
+        guard let value, value.count >= 10 else {
+            return nil
+        }
+        let prefix = String(value.prefix(10))
+        return DateParser.dateString(from: prefix)
+    }
+
+    /// Fallback: data utworzenia pliku w systemie plikow.
+    static func fileCreationDate(of url: URL) -> String? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let created = attributes[.creationDate] as? Date else {
+            return nil
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter.string(from: created)
     }
 
     /// Czasy keyframe'ow ze skanowania pakietow (bez dekodowania — szybkie).
@@ -134,14 +157,31 @@ struct MediaService: Sendable {
             .min { abs($0 - start) < abs($1 - start) }
     }
 
+    static func nearestKeyframe(near start: Double, keyframes: [Double]) -> Double? {
+        keyframes.min { abs($0 - start) < abs($1 - start) }
+    }
+
+    static func losslessStart(
+        near start: Double,
+        keyframes: [Double],
+        frameStep: Double
+    ) -> Double? {
+        snapKeyframe(near: start, keyframes: keyframes, frameStep: frameStep)
+            ?? nearestKeyframe(near: start, keyframes: keyframes)
+    }
+
     static func plannedMethod(
         start: Double,
         keyframes: [Double],
-        frameStep: Double
+        frameStep: Double,
+        cutMode: CutMode = .losslessOnly
     ) -> ExportMethod {
-        snapKeyframe(near: start, keyframes: keyframes, frameStep: frameStep) != nil
-            ? .lossless
-            : .precise
+        if cutMode == .losslessOnly {
+            return .lossless
+        }
+        return snapKeyframe(near: start, keyframes: keyframes, frameStep: frameStep) != nil
+            ? ExportMethod.lossless
+            : ExportMethod.precise
     }
 
     /// Eksport 1 s: bezstratny (`-c copy`), gdy start lezy na keyframe;
@@ -151,45 +191,54 @@ struct MediaService: Sendable {
         outputFolder: URL,
         start: Double,
         metadata: VideoMetadata,
-        keyframes: [Double]
+        keyframes: [Double],
+        dateText: String? = nil,
+        cutMode: CutMode = .losslessOnly
     ) throws -> (url: URL, method: ExportMethod) {
         guard let ffmpegURL = tools.ffmpegURL else {
             throw MediaError.toolMissing("ffmpeg")
         }
-        let output = try nextOutputURL(for: source, in: outputFolder)
+        let date = dateText
+            ?? DateParser.dateString(from: source.lastPathComponent)
+            ?? metadata.recordedDate
+        guard let date else {
+            throw MediaError.noDateInFileName
+        }
+        let output = nextOutputURL(dateText: date, in: outputFolder)
         try FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
 
-        let method: ExportMethod
-        let arguments: [String]
+        let expectedFrames = metadata.fps > 0 ? Int((metadata.fps * 1.0).rounded()) : nil
 
-        if let keyframe = Self.snapKeyframe(
+        if let keyframe = cutMode == .losslessOnly
+            ? Self.losslessStart(near: start, keyframes: keyframes, frameStep: metadata.frameStep)
+            : Self.snapKeyframe(
             near: start,
             keyframes: keyframes,
             frameStep: metadata.frameStep
         ) {
-            // Seek wejsciowy (-ss przed -i): ffmpeg zaczyna kopiowanie dokladnie
-            // od keyframe'a. Ciecie jest pakietowe, wiec klip moze byc o 1-2
-            // klatki dluzszy niz 1 s — walidacja to uwzglednia.
-            method = .lossless
-            arguments = [
-                "-hide_banner",
-                "-loglevel", "error",
-                "-nostdin",
-                "-ss", String(format: "%.3f", keyframe),
-                "-i", source.path,
-                "-t", "1.000",
-                "-map", "0:v:0",
-                "-map", "0:a:0?",
-                "-sn",
-                "-dn",
-                "-c", "copy",
-                "-map_metadata", "0",
-                "-avoid_negative_ts", "make_zero",
-                output.path
-            ]
+            var lastFailure: String?
+            for arguments in losslessExportArguments(source: source, output: output, keyframe: keyframe) {
+                try? FileManager.default.removeItem(at: output)
+                do {
+                    try FFmpegRunner.run(ffmpegURL, arguments)
+                    let validation = try validateClip(
+                        output,
+                        expectedFrames: expectedFrames,
+                        method: .lossless
+                    )
+                    if validation.isValid {
+                        return (output, .lossless)
+                    }
+                    lastFailure = validation.summary(expectedFrames: expectedFrames)
+                    try? FileManager.default.removeItem(at: output)
+                } catch {
+                    lastFailure = error.localizedDescription
+                    try? FileManager.default.removeItem(at: output)
+                }
+            }
+            throw MediaError.invalidExport(lastFailure ?? "nieznany blad eksportu bezstratnego")
         } else {
-            method = .precise
-            arguments = [
+            let arguments = [
                 "-hide_banner",
                 "-loglevel", "error",
                 "-nostdin",
@@ -209,28 +258,60 @@ struct MediaService: Sendable {
                 "-map_metadata", "0",
                 output.path
             ]
+
+            try FFmpegRunner.run(ffmpegURL, arguments)
+
+            let validation = try validateClip(output, expectedFrames: expectedFrames, method: .precise)
+            guard validation.isValid else {
+                try? FileManager.default.removeItem(at: output)
+                throw MediaError.invalidExport(validation.summary(expectedFrames: expectedFrames))
+            }
+
+            return (output, .precise)
         }
-
-        try FFmpegRunner.run(ffmpegURL, arguments)
-
-        let expectedFrames = metadata.fps > 0 ? Int((metadata.fps * 1.0).rounded()) : nil
-        let validation = try validateClip(output, expectedFrames: expectedFrames, method: method)
-        guard validation.isValid else {
-            try? FileManager.default.removeItem(at: output)
-            throw MediaError.invalidExport(validation.summary(expectedFrames: expectedFrames))
-        }
-
-        return (output, method)
     }
 
-    func nextOutputURL(for source: URL, in outputFolder: URL) throws -> URL {
-        guard let date = DateParser.dateString(from: source.lastPathComponent) else {
-            throw MediaError.noDateInFileName
-        }
+    private func losslessExportArguments(source: URL, output: URL, keyframe: Double) -> [[String]] {
+        let start = String(format: "%.3f", keyframe)
+        let commonOutput = [
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-sn",
+            "-dn",
+            "-c", "copy",
+            "-map_metadata", "0",
+            "-avoid_negative_ts", "make_zero",
+            output.path
+        ]
 
+        // Pierwszy wariant dobrze trzyma dokladnie 1 s w czesci plikow 120 fps.
+        let outputSeek = [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-i", source.path,
+            "-ss", start,
+            "-t", "1.000"
+        ] + commonOutput
+
+        // Fallback dla plikow, gdzie output-seek + stream copy zostawia tylko
+        // keyframe. Przy starcie na keyframe szybki seek potrafi skopiowac caly GOP.
+        let inputSeek = [
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-ss", start,
+            "-i", source.path,
+            "-t", "1.000"
+        ] + commonOutput
+
+        return [outputSeek, inputSeek]
+    }
+
+    func nextOutputURL(dateText: String, in outputFolder: URL) -> URL {
         var spaces = 0
         while true {
-            let fileName = "\(date)\(String(repeating: " ", count: spaces)).mov"
+            let fileName = "\(dateText)\(String(repeating: " ", count: spaces)).mov"
             let output = outputFolder.appendingPathComponent(fileName)
             if !FileManager.default.fileExists(atPath: output.path) {
                 return output
@@ -329,6 +410,15 @@ private struct VideoStream: Decodable {
 
 private struct FormatInfo: Decodable {
     let duration: String?
+    let tags: FormatTags?
+}
+
+private struct FormatTags: Decodable {
+    let creationTime: String?
+
+    enum CodingKeys: String, CodingKey {
+        case creationTime = "creation_time"
+    }
 }
 
 private struct PacketProbe: Decodable {

@@ -15,6 +15,10 @@ final class MontageModel: ObservableObject {
     @Published var statusMessage = ""
     @Published var lastOutput: URL?
 
+    /// Podglad wybranego klipu odtwarzany w petli.
+    let previewPlayer = AVQueuePlayer()
+    private var previewLooper: AVPlayerLooper?
+
     private let tools: ToolSet
     private var renderer: MontageRenderer?
     private var thumbnailTask: Task<Void, Never>?
@@ -24,6 +28,7 @@ final class MontageModel: ObservableObject {
 
     init(tools: ToolSet = .detect()) {
         self.tools = tools
+        previewPlayer.isMuted = true
         restoreFolder()
     }
 
@@ -54,6 +59,75 @@ final class MontageModel: ObservableObject {
         let minutes = Int(total) / 60
         let seconds = Int(total) % 60
         return String(format: "%d:%02d", minutes, seconds)
+    }
+
+    /// Pokrycie dni: ile dni w zakresie ma swoja sekunde, ktorych brakuje.
+    var coverage: DayCoverage? {
+        DayCoverage.compute(dates: clips.map(\.captionText))
+    }
+
+    /// Napis dla klipu wg wybranego formatu daty.
+    func formattedCaption(for clip: MontageClip) -> String {
+        Self.formatCaption(clip.captionText, format: settings.captionFormat)
+    }
+
+    static func formatCaption(_ raw: String, format: CaptionFormat) -> String {
+        guard format != .raw,
+              let dateText = DateParser.dateString(from: raw),
+              let date = isoDateFormatter.date(from: dateText) else {
+            return raw
+        }
+        switch format {
+        case .raw:
+            return raw
+        case .iso:
+            return dateText
+        case .dayMonth:
+            return displayFormatter(template: "d.MM").string(from: date)
+        case .dayMonthLong:
+            return displayFormatter(template: "d MMMM").string(from: date)
+        case .dayMonthYearLong:
+            return displayFormatter(template: "d MMMM yyyy").string(from: date)
+        }
+    }
+
+    private static let isoDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter
+    }()
+
+    private static func displayFormatter(template: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.dateFormat = template
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter
+    }
+
+    /// Proponuje tytul na podstawie zakresu dat klipow, np. "Czerwiec 2026".
+    func suggestTitleIfEmpty() {
+        guard settings.titleText.isEmpty, let coverage else {
+            return
+        }
+        guard let first = Self.isoDateFormatter.date(from: coverage.firstDate),
+              let last = Self.isoDateFormatter.date(from: coverage.lastDate) else {
+            return
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC") ?? .current
+        let firstParts = calendar.dateComponents([.year, .month], from: first)
+        let lastParts = calendar.dateComponents([.year, .month], from: last)
+
+        if firstParts.year == lastParts.year, firstParts.month == lastParts.month {
+            let text = Self.displayFormatter(template: "LLLL yyyy").string(from: first)
+            settings.titleText = text.prefix(1).uppercased() + text.dropFirst()
+        } else if firstParts.year == lastParts.year, let year = firstParts.year {
+            settings.titleText = "\(year)"
+        } else if let firstYear = firstParts.year, let lastYear = lastParts.year {
+            settings.titleText = "\(firstYear)-\(lastYear)"
+        }
     }
 
     // MARK: - Folder i klipy
@@ -101,10 +175,23 @@ final class MontageModel: ObservableObject {
         suppressProjectSave = false
 
         clips = found
-        selectedClipID = found.first?.id
         thumbnails = [:]
         statusMessage = "Znaleziono \(found.count) klipow"
+        selectClip(found.first?.id)
         loadThumbnails(for: found.map(\.url))
+    }
+
+    /// Wybiera klip i odtwarza go w petli w podgladzie.
+    func selectClip(_ id: URL?) {
+        selectedClipID = id
+        previewLooper = nil
+        previewPlayer.removeAllItems()
+        guard let id else {
+            return
+        }
+        let item = AVPlayerItem(url: id)
+        previewLooper = AVPlayerLooper(player: previewPlayer, templateItem: item)
+        previewPlayer.play()
     }
 
     private func applySavedOrder(to clips: inout [MontageClip], order: [String], excluded: [String]) {
@@ -257,7 +344,7 @@ final class MontageModel: ObservableObject {
         progress = RenderProgress(stage: "Start", fraction: 0)
         statusMessage = "Renderuje..."
 
-        let payload = included.map { (url: $0.url, caption: $0.captionText) }
+        let payload = included.map { (url: $0.url, caption: formattedCaption(for: $0)) }
         let settings = self.settings
         let applyProgress: @MainActor (RenderProgress) -> Void = { [weak self] update in
             self?.progress = update
@@ -301,5 +388,9 @@ final class MontageModel: ObservableObject {
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([lastOutput])
+    }
+
+    func revealClip(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 }

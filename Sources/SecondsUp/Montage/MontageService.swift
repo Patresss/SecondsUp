@@ -181,6 +181,9 @@ final class MontageRenderer: @unchecked Sendable {
         if settings.keepClipAudio {
             if hasAudio {
                 arguments += ["-map", "0:a:0"]
+                if abs(settings.clipAudioVolume - 1.0) > 0.01 {
+                    arguments += ["-af", String(format: "volume=%.2f", settings.clipAudioVolume)]
+                }
             } else {
                 arguments += ["-map", "1:a:0", "-shortest"]
             }
@@ -191,8 +194,8 @@ final class MontageRenderer: @unchecked Sendable {
 
         arguments += [
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "18",
+            "-preset", settings.renderQuality.preset,
+            "-crf", settings.renderQuality.crf,
             "-pix_fmt", "yuv420p",
             output.path
         ]
@@ -232,8 +235,8 @@ final class MontageRenderer: @unchecked Sendable {
         }
         arguments += [
             "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "18",
+            "-preset", settings.renderQuality.preset,
+            "-crf", settings.renderQuality.crf,
             "-pix_fmt", "yuv420p",
             output.path
         ]

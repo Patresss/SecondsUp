@@ -13,6 +13,9 @@ struct MontageView: View {
             settingsPanel
                 .frame(minWidth: 720, minHeight: 620)
         }
+        .folderDrop { url in
+            model.loadFolder(url)
+        }
         .toolbar {
             ToolbarItemGroup {
                 Button(action: model.chooseFolder) {
@@ -33,6 +36,11 @@ struct MontageView: View {
         }
         .onChange(of: model.settings) { _ in
             model.saveProject()
+        }
+        .onChange(of: model.settings.titleEnabled) { enabled in
+            if enabled {
+                model.suggestTitleIfEmpty()
+            }
         }
     }
 
@@ -62,6 +70,12 @@ struct MontageView: View {
             }
             .padding(14)
 
+            if let coverage = model.coverage {
+                CoverageBar(coverage: coverage)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 10)
+            }
+
             Divider()
 
             if model.clips.isEmpty {
@@ -79,7 +93,7 @@ struct MontageView: View {
             } else {
                 List(selection: Binding(
                     get: { model.selectedClipID },
-                    set: { model.selectedClipID = $0 }
+                    set: { model.selectClip($0) }
                 )) {
                     ForEach(model.clips) { clip in
                         ClipRow(
@@ -91,6 +105,14 @@ struct MontageView: View {
                             )
                         )
                         .tag(clip.id as URL?)
+                        .contextMenu {
+                            Button("Pokaz w Finderze") {
+                                model.revealClip(clip.url)
+                            }
+                            Button(clip.include ? "Wyklucz z montazu" : "Wlacz do montazu") {
+                                model.setInclude(clip.id, include: !clip.include)
+                            }
+                        }
                     }
                     .onMove { source, destination in
                         model.moveClips(from: source, to: destination)
@@ -142,11 +164,8 @@ struct MontageView: View {
 
     private var preview: some View {
         ZStack {
-            if let clip = model.selectedClip ?? model.includedClips.first {
-                previewOverlay(
-                    thumbnail: model.thumbnails[clip.url],
-                    caption: clip.captionText
-                )
+            if let clip = model.selectedClip {
+                previewOverlay(caption: model.formattedCaption(for: clip))
             } else {
                 VStack(spacing: 10) {
                     Image(systemName: "photo.on.rectangle")
@@ -160,20 +179,11 @@ struct MontageView: View {
         }
     }
 
-    private func previewOverlay(thumbnail: NSImage?, caption: String) -> some View {
+    private func previewOverlay(caption: String) -> some View {
         GeometryReader { proxy in
             ZStack(alignment: overlayAlignment) {
-                Group {
-                    if let thumbnail {
-                        Image(nsImage: thumbnail)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                    } else {
-                        Rectangle()
-                            .fill(Color.secondary.opacity(0.2))
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                PlayerView(player: model.previewPlayer)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 if model.settings.captionEnabled {
                     Text(caption)
@@ -181,6 +191,7 @@ struct MontageView: View {
                         .foregroundStyle(.white.opacity(model.settings.captionOpacity))
                         .shadow(color: .black.opacity(0.7), radius: 1, x: 1, y: 1)
                         .padding(14)
+                        .allowsHitTesting(false)
                 }
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
@@ -231,13 +242,23 @@ struct MontageView: View {
 
             if model.settings.captionEnabled {
                 HStack(spacing: 16) {
+                    Picker("Format", selection: $model.settings.captionFormat) {
+                        ForEach(CaptionFormat.allCases) { format in
+                            Text(format.label).tag(format)
+                        }
+                    }
+                    .frame(maxWidth: 280)
+
                     Picker("Pozycja", selection: $model.settings.captionPosition) {
                         ForEach(CaptionPosition.allCases) { position in
                             Text(position.label).tag(position)
                         }
                     }
-                    .frame(maxWidth: 260)
+                    .frame(maxWidth: 240)
+                }
+                .font(.callout)
 
+                HStack(spacing: 16) {
                     HStack {
                         Text("Rozmiar")
                         Slider(value: $model.settings.captionFontSize, in: 18...72, step: 2)
@@ -300,9 +321,21 @@ struct MontageView: View {
                 .font(.callout)
             }
 
-            Toggle("Zachowaj dzwiek klipow", isOn: $model.settings.keepClipAudio)
-                .font(.callout)
-                .help("Bez muzyki i bez tej opcji film bedzie niemy")
+            HStack(spacing: 16) {
+                Toggle("Zachowaj dzwiek klipow", isOn: $model.settings.keepClipAudio)
+                    .help("Bez muzyki i bez tej opcji film bedzie niemy")
+
+                if model.settings.keepClipAudio {
+                    HStack {
+                        Text("Glosnosc klipow")
+                        Slider(value: $model.settings.clipAudioVolume, in: 0.1...1.5)
+                            .frame(width: 140)
+                        Text(String(format: "%.0f%%", model.settings.clipAudioVolume * 100))
+                            .monospacedDigit()
+                    }
+                }
+            }
+            .font(.callout)
         }
     }
 
@@ -325,6 +358,14 @@ struct MontageView: View {
                     }
                 }
                 .frame(maxWidth: 120)
+
+                Picker("Jakosc", selection: $model.settings.renderQuality) {
+                    ForEach(RenderQuality.allCases) { quality in
+                        Text(quality.label).tag(quality)
+                    }
+                }
+                .frame(maxWidth: 200)
+                .help("Szybka: krotszy czas renderu. Najlepsza: mniejsze artefakty, wolniejszy render.")
             }
             .font(.callout)
         }
@@ -363,6 +404,80 @@ struct MontageView: View {
                 .disabled(!model.canUseTools || model.includedClips.isEmpty)
             }
         }
+    }
+}
+
+// MARK: - Pokrycie dni
+
+private struct CoverageBar: View {
+    let coverage: DayCoverage
+    @State private var showMissing = false
+
+    private var isComplete: Bool {
+        coverage.missing.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: isComplete ? "checkmark.seal.fill" : "calendar.badge.exclamationmark")
+                    .foregroundStyle(isComplete ? .green : .orange)
+
+                Text("\(coverage.daysCovered)/\(coverage.daysTotal) dni")
+                    .font(.caption.weight(.semibold))
+
+                Text("\(coverage.firstDate) – \(coverage.lastDate)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                if !isComplete {
+                    Button("brakuje \(coverage.missing.count)") {
+                        showMissing.toggle()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+                    .popover(isPresented: $showMissing) {
+                        missingList
+                    }
+                }
+            }
+
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.secondary.opacity(0.18))
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(isComplete ? Color.green : Color.orange)
+                        .frame(
+                            width: proxy.size.width
+                                * CGFloat(coverage.daysCovered)
+                                / CGFloat(max(1, coverage.daysTotal))
+                        )
+                }
+            }
+            .frame(height: 4)
+        }
+    }
+
+    private var missingList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Dni bez sekundy")
+                .font(.headline)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(coverage.missing, id: \.self) { date in
+                        Text(date)
+                            .font(.callout.monospacedDigit())
+                    }
+                }
+            }
+            .frame(maxHeight: 260)
+        }
+        .padding(14)
+        .frame(width: 180)
     }
 }
 

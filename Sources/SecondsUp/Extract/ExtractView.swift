@@ -13,6 +13,9 @@ struct ExtractView: View {
             mainPanel
                 .frame(minWidth: 720, minHeight: 620)
         }
+        .folderDrop { url in
+            model.loadInputFolder(url)
+        }
         .toolbar {
             ToolbarItemGroup {
                 Button(action: model.chooseInputFolder) {
@@ -82,6 +85,20 @@ struct ExtractView: View {
                             isLoading: video.analysis == nil && video.analysisError == nil
                         )
                         .tag(video.id as URL?)
+                        .contextMenu {
+                            Button("Pokaz w Finderze") {
+                                model.revealInFinder(video.url)
+                            }
+                            if case .exported = video.exportState {
+                                Button("Pokaz wyeksportowana sekunde") {
+                                    model.revealExportedClip(for: video)
+                                }
+                            }
+                            Divider()
+                            Button("Przelicz rekomendacje") {
+                                model.reanalyze(video.url)
+                            }
+                        }
                     }
                 }
                 .listStyle(.sidebar)
@@ -157,8 +174,8 @@ struct ExtractView: View {
 
     private func controls(video: VideoItem) -> some View {
         VStack(spacing: 12) {
-            if let analysis = video.analysis, !analysis.candidates.isEmpty {
-                candidateStrip(analysis: analysis)
+            if video.analysis != nil, !model.selectedCandidates.isEmpty {
+                candidateStrip(candidates: model.selectedCandidates)
             } else if let error = video.analysisError {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -174,8 +191,8 @@ struct ExtractView: View {
                 duration: video.metadata?.duration ?? 1,
                 start: model.selectedStart,
                 keyframes: video.analysis?.keyframes ?? [],
-                candidates: video.analysis?.candidates ?? [],
-                onScrub: { model.setStart($0) }
+                candidates: model.selectedCandidates,
+                onScrub: { model.setStart($0, snapToLossless: true) }
             )
             .frame(height: 64)
 
@@ -214,7 +231,7 @@ struct ExtractView: View {
                     Label("Rekomendacja", systemImage: "wand.and.stars")
                 }
                 .keyboardShortcut("r", modifiers: .command)
-                .disabled(video.topCandidate == nil)
+                .disabled(model.selectedTopCandidate == nil)
                 .help("Najlepszy kandydat (⌘R)")
 
                 Button(action: model.playSelectedSecond) {
@@ -222,7 +239,13 @@ struct ExtractView: View {
                 }
                 .keyboardShortcut(.space, modifiers: [])
                 .disabled(video.metadata == nil)
-                .help("Odtworz zaznaczona sekunde (spacja)")
+                .help("Odtworz/zatrzymaj zaznaczona sekunde (spacja)")
+
+                Toggle(isOn: $model.loopPreview) {
+                    Image(systemName: "repeat")
+                }
+                .toggleStyle(.button)
+                .help("Podglad w petli")
 
                 Spacer()
 
@@ -236,6 +259,14 @@ struct ExtractView: View {
             }
 
             HStack(spacing: 14) {
+                Picker("Tryb cięcia", selection: $model.cutMode) {
+                    ForEach(CutMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .frame(width: 220)
+                .help(model.cutMode.help)
+
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Start")
                         .font(.caption)
@@ -254,17 +285,20 @@ struct ExtractView: View {
 
                 if let method = model.plannedExportMethod {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Ciecie")
+                        Text("Eksport")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text(method.label)
+                        Text(model.plannedExportText ?? method.label)
                             .foregroundStyle(method == .lossless ? Color.green : Color.orange)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    .frame(width: 310, alignment: .leading)
                 }
 
                 Spacer()
 
-                if let top = video.topCandidate {
+                if let top = model.selectedTopCandidate {
                     Text(top.reason)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -275,10 +309,10 @@ struct ExtractView: View {
         .padding(16)
     }
 
-    private func candidateStrip(analysis: AnalysisResult) -> some View {
+    private func candidateStrip(candidates: [Candidate]) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(Array(analysis.candidates.enumerated()), id: \.element.id) { index, candidate in
+                ForEach(Array(candidates.enumerated()), id: \.element.id) { index, candidate in
                     CandidateChip(
                         candidate: candidate,
                         rank: index + 1,
@@ -387,7 +421,18 @@ private struct VideoRow: View {
                     .lineLimit(1)
 
                 HStack(spacing: 8) {
-                    Text(video.dateString ?? "bez daty")
+                    if let date = video.effectiveDate {
+                        HStack(spacing: 3) {
+                            Text(date)
+                            if video.dateFromMetadata {
+                                Image(systemName: "info.circle")
+                                    .help("Data z metadanych nagrania (nazwa pliku nie zawiera daty)")
+                            }
+                        }
+                    } else {
+                        Text("bez daty")
+                            .foregroundStyle(.red)
+                    }
                     if let metadata = video.metadata {
                         Text(String(format: "%.0f fps", metadata.fps))
                     }

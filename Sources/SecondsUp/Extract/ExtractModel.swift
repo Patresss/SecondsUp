@@ -20,13 +20,25 @@ final class ExtractModel: ObservableObject {
     @Published var isBatchExporting = false
     @Published var candidateThumbnails: [Double: NSImage] = [:]
     @Published var player = AVPlayer()
+    /// Podglad 1 s w petli — sekunda odtwarza sie w kolko az do zatrzymania.
+    @Published var loopPreview = false
+    @Published var cutMode: CutMode = .losslessOnly {
+        didSet {
+            UserDefaults.standard.set(cutMode.rawValue, forKey: Self.cutModeKey)
+            if oldValue != cutMode {
+                applyTopRecommendationForCurrentMode()
+            }
+        }
+    }
 
     private let service: MediaService
     private var analysisTasks: [URL: Task<AnalysisOutcome, Never>] = [:]
     private var backgroundAnalysisTask: Task<Void, Never>?
+    private var previewToken = UUID()
 
     private static let inputFolderKey = "extract.inputFolder"
     private static let outputFolderKey = "extract.outputFolder"
+    private static let cutModeKey = "extract.cutMode"
 
     init(service: MediaService = MediaService()) {
         self.service = service
@@ -59,6 +71,26 @@ final class ExtractModel: ObservableObject {
         selectedVideo?.analysis
     }
 
+    var selectedCandidates: [Candidate] {
+        selectedAnalysis?.candidates(for: cutMode) ?? []
+    }
+
+    var selectedTopCandidate: Candidate? {
+        selectedCandidates.first
+    }
+
+    var selectedLosslessExportStart: Double? {
+        guard let metadata = selectedMetadata,
+              let analysis = selectedAnalysis else {
+            return nil
+        }
+        return MediaService.losslessStart(
+            near: selectedStart,
+            keyframes: analysis.keyframes,
+            frameStep: metadata.frameStep
+        )
+    }
+
     var isLoadingSelected: Bool {
         guard let video = selectedVideo else {
             return false
@@ -86,8 +118,41 @@ final class ExtractModel: ObservableObject {
         return MediaService.plannedMethod(
             start: selectedStart,
             keyframes: analysis.keyframes,
-            frameStep: metadata.frameStep
+            frameStep: metadata.frameStep,
+            cutMode: cutMode
         )
+    }
+
+    var plannedExportText: String? {
+        guard let metadata = selectedMetadata,
+              let analysis = selectedAnalysis else {
+            return nil
+        }
+        switch cutMode {
+        case .autoPrecise:
+            return MediaService.plannedMethod(
+                start: selectedStart,
+                keyframes: analysis.keyframes,
+                frameStep: metadata.frameStep,
+                cutMode: cutMode
+            ).label
+        case .losslessOnly:
+            if let start = selectedLosslessExportStart {
+                let delta = start - selectedStart
+                let codec = codecCopyLabel(for: metadata)
+                if abs(delta) <= max(metadata.frameStep * 0.6, 0.02) {
+                    return String(format: "%.3f-%.3fs, %@", start, start + 1.0, codec)
+                }
+                return String(
+                    format: "Najbliższe bezstratne: %.3f-%.3fs (%+.3fs), %@",
+                    start,
+                    start + 1.0,
+                    delta,
+                    codec
+                )
+            }
+            return "bezstratnie"
+        }
     }
 
     var analyzedCount: Int {
@@ -144,6 +209,10 @@ final class ExtractModel: ObservableObject {
 
     private func restoreFolders() {
         let defaults = UserDefaults.standard
+        if let raw = defaults.string(forKey: Self.cutModeKey),
+           let restored = CutMode(rawValue: raw) {
+            cutMode = restored
+        }
         if let path = defaults.string(forKey: Self.outputFolderKey),
            FileManager.default.fileExists(atPath: path) {
             outputFolder = URL(fileURLWithPath: path)
@@ -157,6 +226,7 @@ final class ExtractModel: ObservableObject {
     // MARK: - Wybor filmu
 
     func selectVideo(_ id: URL?) {
+        previewToken = UUID()
         selectedVideoID = id
         selectedStart = 0
         candidateThumbnails = [:]
@@ -179,12 +249,13 @@ final class ExtractModel: ObservableObject {
             }
             switch outcome {
             case .success(_, let analysis):
-                if let top = analysis.candidates.first {
+                let candidates = analysis.candidates(for: self.cutMode)
+                if let top = candidates.first {
                     self.setStart(top.start)
                 }
                 self.statusMessage = String(
                     format: "Rekomendacja gotowa: %d kandydatow, %d probek",
-                    analysis.candidates.count,
+                    candidates.count,
                     analysis.sampleCount
                 )
                 await self.loadThumbnails(for: id, analysis: analysis)
@@ -197,7 +268,10 @@ final class ExtractModel: ObservableObject {
     }
 
     private func loadThumbnails(for url: URL, analysis: AnalysisResult) async {
-        let starts = analysis.candidates.map(\.start)
+        var seen = Set<Double>()
+        let starts = (analysis.losslessCandidates + analysis.candidates)
+            .map(\.start)
+            .filter { seen.insert($0).inserted }
         let images = await Task.detached(priority: .utility) {
             VideoAnalyzer.thumbnails(url: url, times: starts)
         }.value
@@ -302,45 +376,84 @@ final class ExtractModel: ObservableObject {
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
-    func setStart(_ start: Double) {
-        selectedStart = min(max(0, start), maxStart)
+    func setStart(_ start: Double, snapToLossless: Bool = false) {
+        previewToken = UUID()
+        player.pause()
+        var resolvedStart = start
+        if snapToLossless,
+           cutMode == .losslessOnly,
+           let metadata = selectedMetadata,
+           let analysis = selectedAnalysis,
+           let keyframe = MediaService.losslessStart(
+            near: start,
+            keyframes: analysis.keyframes,
+            frameStep: metadata.frameStep
+           ) {
+            resolvedStart = keyframe
+        }
+        selectedStart = min(max(0, resolvedStart), maxStart)
         seekToSelectedStart()
     }
 
     func stepBackward() {
+        if cutMode == .losslessOnly, let previous = adjacentLosslessStart(direction: -1) {
+            setStart(previous)
+            return
+        }
         setStart(selectedStart - frameStep)
     }
 
     func stepForward() {
+        if cutMode == .losslessOnly, let next = adjacentLosslessStart(direction: 1) {
+            setStart(next)
+            return
+        }
         setStart(selectedStart + frameStep)
     }
 
     func jumpBackward() {
-        setStart(selectedStart - 0.5)
+        setStart(selectedStart - 0.5, snapToLossless: true)
     }
 
     func jumpForward() {
-        setStart(selectedStart + 0.5)
+        setStart(selectedStart + 0.5, snapToLossless: true)
     }
 
     func useRecommendation() {
-        guard let top = selectedVideo?.topCandidate else {
+        guard let top = selectedTopCandidate else {
             return
         }
         setStart(top.start)
     }
 
+    /// Odtwarza zaznaczona sekunde; drugie wywolanie w trakcie zatrzymuje.
+    /// Przy wlaczonej petli sekunda powtarza sie do zatrzymania.
     func playSelectedSecond() {
+        if player.rate > 0 {
+            previewToken = UUID()
+            player.pause()
+            return
+        }
+        let token = UUID()
+        previewToken = token
+        playOnce(token: token)
+    }
+
+    private func playOnce(token: UUID) {
         let startTime = CMTime(seconds: selectedStart, preferredTimescale: 600)
         player.seek(to: startTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor in
-                guard let self else {
+                guard let self, self.previewToken == token else {
                     return
                 }
                 self.player.play()
-                let startToken = self.selectedStart
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if abs(self.selectedStart - startToken) < 0.0001 {
+                guard self.previewToken == token else {
+                    return
+                }
+                if self.loopPreview {
+                    self.playOnce(token: token)
+                } else {
                     self.player.pause()
                 }
             }
@@ -364,13 +477,19 @@ final class ExtractModel: ObservableObject {
             return
         }
 
+        guard let dateText = video.effectiveDate else {
+            statusMessage = "Brak daty: ani w nazwie pliku, ani w metadanych nagrania."
+            return
+        }
+
         isExporting = true
         updateVideo(video.id) { $0.exportState = .exporting }
         statusMessage = "Eksportuje \(video.fileName)..."
 
         let service = self.service
-        let start = selectedStart
+        let start = resolvedExportStart(for: video, metadata: metadata)
         let keyframes = video.analysis?.keyframes ?? []
+        let selectedCutMode = cutMode
         Task {
             do {
                 let result = try await Task.detached {
@@ -379,7 +498,9 @@ final class ExtractModel: ObservableObject {
                         outputFolder: outputFolder,
                         start: start,
                         metadata: metadata,
-                        keyframes: keyframes
+                        keyframes: keyframes,
+                        dateText: dateText,
+                        cutMode: selectedCutMode
                     )
                 }.value
 
@@ -408,6 +529,7 @@ final class ExtractModel: ObservableObject {
 
         isBatchExporting = true
         let service = self.service
+        let selectedCutMode = cutMode
         Task { [weak self] in
             guard let self else {
                 return
@@ -427,8 +549,13 @@ final class ExtractModel: ObservableObject {
 
                 let outcome = await self.ensureAnalysis(for: url).value
                 guard case .success(let metadata, let analysis) = outcome,
-                      let top = analysis.candidates.first else {
+                      let top = analysis.candidates(for: selectedCutMode).first else {
                     failures.append(url.lastPathComponent)
+                    continue
+                }
+                guard let dateText = DateParser.dateString(from: url.lastPathComponent)
+                        ?? metadata.recordedDate else {
+                    failures.append("\(url.lastPathComponent) (brak daty)")
                     continue
                 }
 
@@ -443,7 +570,9 @@ final class ExtractModel: ObservableObject {
                             outputFolder: outputFolder,
                             start: start,
                             metadata: metadata,
-                            keyframes: keyframes
+                            keyframes: keyframes,
+                            dateText: dateText,
+                            cutMode: selectedCutMode
                         )
                     }.value
                     self.updateVideo(url) { $0.exportState = .exported(result.url) }
@@ -466,6 +595,35 @@ final class ExtractModel: ObservableObject {
         }
     }
 
+    // MARK: - Akcje kontekstowe
+
+    /// Czysci cache i liczy rekomendacje od nowa dla danego pliku.
+    func reanalyze(_ url: URL) {
+        analysisTasks[url]?.cancel()
+        analysisTasks[url] = nil
+        AnalysisCache.remove(for: url)
+        updateVideo(url) {
+            $0.metadata = nil
+            $0.analysis = nil
+            $0.analysisError = nil
+        }
+        if selectedVideoID == url {
+            selectVideo(url)
+        } else {
+            ensureAnalysis(for: url)
+        }
+    }
+
+    func revealInFinder(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func revealExportedClip(for item: VideoItem) {
+        if case .exported(let url) = item.exportState {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+
     // MARK: - Pomocnicze
 
     private func updateVideo(_ id: URL, _ update: (inout VideoItem) -> Void) {
@@ -473,5 +631,81 @@ final class ExtractModel: ObservableObject {
             return
         }
         update(&videos[index])
+    }
+
+    private func applyTopRecommendationForCurrentMode() {
+        guard let top = selectedTopCandidate else {
+            return
+        }
+        setStart(top.start)
+        if let selectedVideoID,
+           let analysis = selectedAnalysis {
+            Task {
+                await loadThumbnails(for: selectedVideoID, analysis: analysis)
+            }
+        }
+    }
+
+    private func resolvedExportStart(for video: VideoItem, metadata: VideoMetadata) -> Double {
+        guard cutMode == .losslessOnly,
+              let analysis = video.analysis,
+              let start = MediaService.losslessStart(
+                near: selectedStart,
+                keyframes: analysis.keyframes,
+                frameStep: metadata.frameStep
+              ) else {
+            return selectedStart
+        }
+        return start
+    }
+
+    private func adjacentLosslessStart(direction: Int) -> Double? {
+        guard let metadata = selectedMetadata,
+              let analysis = selectedAnalysis else {
+            return nil
+        }
+        let starts = losslessStarts(analysis: analysis, metadata: metadata)
+        guard !starts.isEmpty else {
+            return nil
+        }
+
+        let tolerance = max(metadata.frameStep * 0.6, 0.02)
+        if direction < 0 {
+            return starts.last { $0 < selectedStart - tolerance } ?? starts.first
+        }
+        return starts.first { $0 > selectedStart + tolerance } ?? starts.last
+    }
+
+    private func losslessStarts(analysis: AnalysisResult, metadata: VideoMetadata) -> [Double] {
+        let maxStart = max(0, metadata.duration - 1.0)
+        let tolerance = max(metadata.frameStep * 0.5, 0.005)
+        var starts = analysis.keyframes
+            .map { max(0, ($0 * 1000).rounded() / 1000) }
+            .filter { $0 <= maxStart + tolerance }
+            .sorted()
+        if starts.first.map({ $0 > tolerance }) ?? true {
+            starts.insert(0, at: 0)
+        }
+
+        var cleaned: [Double] = []
+        for start in starts {
+            if cleaned.last.map({ abs($0 - start) > 0.01 }) ?? true {
+                cleaned.append(start)
+            }
+        }
+        return cleaned
+    }
+
+    private func codecCopyLabel(for metadata: VideoMetadata) -> String {
+        switch metadata.codec.lowercased() {
+        case "hevc", "h265":
+            return "HEVC copy"
+        case "h264":
+            return "H.264 copy"
+        case "":
+            return "copy"
+        default:
+            return "\(metadata.codec.uppercased()) copy"
+        }
     }
 }

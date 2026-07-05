@@ -97,6 +97,72 @@ enum ResolutionPreset: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum CaptionFormat: String, Codable, CaseIterable, Identifiable {
+    case raw
+    case iso
+    case dayMonth
+    case dayMonthLong
+    case dayMonthYearLong
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .raw:
+            return "jak nazwa pliku"
+        case .iso:
+            return "2026-06-05"
+        case .dayMonth:
+            return "5.06"
+        case .dayMonthLong:
+            return "5 czerwca"
+        case .dayMonthYearLong:
+            return "5 czerwca 2026"
+        }
+    }
+}
+
+enum RenderQuality: String, Codable, CaseIterable, Identifiable {
+    case fast
+    case standard
+    case best
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .fast:
+            return "Szybka"
+        case .standard:
+            return "Standard"
+        case .best:
+            return "Najlepsza"
+        }
+    }
+
+    var preset: String {
+        switch self {
+        case .fast:
+            return "veryfast"
+        case .standard:
+            return "medium"
+        case .best:
+            return "slow"
+        }
+    }
+
+    var crf: String {
+        switch self {
+        case .fast:
+            return "20"
+        case .standard:
+            return "18"
+        case .best:
+            return "16"
+        }
+    }
+}
+
 struct MontageSettings: Codable, Equatable {
     var titleEnabled = false
     var titleText = ""
@@ -104,6 +170,7 @@ struct MontageSettings: Codable, Equatable {
 
     var captionEnabled = true
     var captionPosition: CaptionPosition = .bottomRight
+    var captionFormat: CaptionFormat = .raw
     var captionFontSize = 36.0
     var captionOpacity = 0.9
 
@@ -112,13 +179,96 @@ struct MontageSettings: Codable, Equatable {
     var musicFadeOut = true
     var musicFadeDuration = 2.0
     var keepClipAudio = false
+    var clipAudioVolume = 1.0
 
     var resolution: ResolutionPreset = .p1080
     var fps = 30
+    var renderQuality: RenderQuality = .standard
 
     /// Kolejnosc (nazwy plikow) i wykluczenia zapisane w projekcie.
     var order: [String] = []
     var excluded: [String] = []
+
+    init() {}
+
+    // Odporne dekodowanie: brakujace pola (starsze wersje projektu)
+    // dostaja wartosci domyslne zamiast psuc caly plik.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = MontageSettings()
+        titleEnabled = try container.decodeIfPresent(Bool.self, forKey: .titleEnabled) ?? defaults.titleEnabled
+        titleText = try container.decodeIfPresent(String.self, forKey: .titleText) ?? defaults.titleText
+        titleDuration = try container.decodeIfPresent(Double.self, forKey: .titleDuration) ?? defaults.titleDuration
+        captionEnabled = try container.decodeIfPresent(Bool.self, forKey: .captionEnabled) ?? defaults.captionEnabled
+        captionPosition = try container.decodeIfPresent(CaptionPosition.self, forKey: .captionPosition) ?? defaults.captionPosition
+        captionFormat = try container.decodeIfPresent(CaptionFormat.self, forKey: .captionFormat) ?? defaults.captionFormat
+        captionFontSize = try container.decodeIfPresent(Double.self, forKey: .captionFontSize) ?? defaults.captionFontSize
+        captionOpacity = try container.decodeIfPresent(Double.self, forKey: .captionOpacity) ?? defaults.captionOpacity
+        musicPath = try container.decodeIfPresent(String.self, forKey: .musicPath)
+        musicVolume = try container.decodeIfPresent(Double.self, forKey: .musicVolume) ?? defaults.musicVolume
+        musicFadeOut = try container.decodeIfPresent(Bool.self, forKey: .musicFadeOut) ?? defaults.musicFadeOut
+        musicFadeDuration = try container.decodeIfPresent(Double.self, forKey: .musicFadeDuration) ?? defaults.musicFadeDuration
+        keepClipAudio = try container.decodeIfPresent(Bool.self, forKey: .keepClipAudio) ?? defaults.keepClipAudio
+        clipAudioVolume = try container.decodeIfPresent(Double.self, forKey: .clipAudioVolume) ?? defaults.clipAudioVolume
+        resolution = try container.decodeIfPresent(ResolutionPreset.self, forKey: .resolution) ?? defaults.resolution
+        fps = try container.decodeIfPresent(Int.self, forKey: .fps) ?? defaults.fps
+        renderQuality = try container.decodeIfPresent(RenderQuality.self, forKey: .renderQuality) ?? defaults.renderQuality
+        order = try container.decodeIfPresent([String].self, forKey: .order) ?? []
+        excluded = try container.decodeIfPresent([String].self, forKey: .excluded) ?? []
+    }
+}
+
+/// Pokrycie dni w projekcie 1SE: ktore daty maja sekunde, ktorych brakuje.
+struct DayCoverage {
+    let firstDate: String
+    let lastDate: String
+    let daysTotal: Int
+    let daysCovered: Int
+    let missing: [String]
+
+    static func compute(dates rawDates: [String]) -> DayCoverage? {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+
+        let covered = Set(rawDates.compactMap { DateParser.dateString(from: $0) })
+        guard !covered.isEmpty,
+              let first = covered.min(),
+              let last = covered.max(),
+              let firstDate = formatter.date(from: first),
+              let lastDate = formatter.date(from: last) else {
+            return nil
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC") ?? .current
+
+        var missing: [String] = []
+        var total = 0
+        var current = firstDate
+        // Bezpiecznik na absurdalnie szerokie zakresy dat.
+        let maxDays = 5000
+        while current <= lastDate && total < maxDays {
+            total += 1
+            let text = formatter.string(from: current)
+            if !covered.contains(text) {
+                missing.append(text)
+            }
+            guard let next = calendar.date(byAdding: .day, value: 1, to: current) else {
+                break
+            }
+            current = next
+        }
+
+        return DayCoverage(
+            firstDate: first,
+            lastDate: last,
+            daysTotal: total,
+            daysCovered: total - missing.count,
+            missing: missing
+        )
+    }
 }
 
 /// Plik projektu zapisywany w folderze klipow.

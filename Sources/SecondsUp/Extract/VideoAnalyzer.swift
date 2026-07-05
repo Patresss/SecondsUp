@@ -8,8 +8,8 @@ import Vision
 /// Fazy:
 /// 1. Gesty skan calego filmu (AVAssetImageGenerator, ~320 px):
 ///    metryki techniczne + detekcja twarzy (Vision).
-/// 2. Scoring okien 1 s na siatce co 0.2 s, normalizacja percentylowa
-///    w obrebie filmu, kara za ciecie sceny, bonus za energie audio.
+/// 2. Scoring okien 1 s na siatce co 0.2 s oraz osobno scoring okien
+///    startujacych na keyframe'ach dla trybu bezstratnego.
 /// 3. Doprecyzowanie top-N (NMS) na gestszych probkach + saliency (Vision).
 enum VideoAnalyzer {
     struct Weights {
@@ -44,6 +44,7 @@ enum VideoAnalyzer {
             let candidate = Candidate(start: 0, score: 1, reason: "film ma okolo 1 s")
             return AnalysisResult(
                 candidates: [candidate],
+                losslessCandidates: [candidate],
                 keyframes: keyframes,
                 waveform: waveform,
                 sampleCount: 1
@@ -59,61 +60,86 @@ enum VideoAnalyzer {
         let stats = VideoStats(samples: samples)
         let maxStart = max(0, duration - 1.0)
 
-        // Faza 2: scoring okien.
+        // Faza 2a: scoring okien precyzyjnych.
         var starts: [Double] = Array(stride(from: 0.0, through: maxStart, by: windowStep))
         if let last = starts.last, maxStart - last > 0.01 {
             starts.append(maxStart)
         }
 
-        let audioEnergies = starts.map {
-            AudioWaveform.windowEnergy(waveform: waveform, duration: duration, start: $0, length: 1.0)
-        }
-        let audioRank = Percentiler(values: audioEnergies)
+        let windows = scoreWindows(
+            starts: starts,
+            samples: samples,
+            stats: stats,
+            waveform: waveform,
+            duration: duration
+        )
 
-        var windows: [(start: Double, score: Double)] = []
-        for (index, start) in starts.enumerated() {
-            let inWindow = samples.filter { $0.time >= start - 0.02 && $0.time <= start + 1.02 }
-            guard !inWindow.isEmpty else {
-                continue
-            }
-            let imageQ = averageImageQuality(of: inWindow, stats: stats)
-            let faceQ = faceQuality(of: inWindow)
-            let motion = motionQuality(of: inWindow)
-            let audioQ = waveform.isEmpty ? 0.5 : audioRank.rank(audioEnergies[index])
-            var score = 0.38 * imageQ + 0.20 * faceQ + 0.22 * motion.quality + 0.20 * audioQ
-            if motion.sceneCut {
-                score *= 0.25
-            }
-            windows.append((start, score))
-        }
-
-        // NMS: top-N okien z minimalnym odstepem.
+        // NMS: top-N okien precyzyjnych z minimalnym odstepem.
         let separation = duration < 4 ? 0.6 : 1.5
         let selected = nonMaxSuppression(windows: windows, separation: separation, limit: maxCandidates)
 
-        // Faza 3: doprecyzowanie.
-        var candidates: [Candidate] = []
         let weights = Weights()
-        for start in selected {
-            if let candidate = refine(
-                url: url,
-                start: start,
-                duration: duration,
-                stats: stats,
-                waveform: waveform,
-                weights: weights
-            ) {
-                candidates.append(candidate)
-            }
-        }
-        candidates.sort { $0.score > $1.score }
+        var candidates = refineCandidates(
+            starts: selected,
+            url: url,
+            duration: duration,
+            stats: stats,
+            waveform: waveform,
+            weights: weights
+        )
 
         if candidates.isEmpty {
             candidates = [Candidate(start: 0, score: 0, reason: "analiza nie znalazla kandydatow")]
         }
 
+        // Faza 2b/3b: osobna lista kandydatow bezstratnych. Te starty sa
+        // ograniczone do keyframe'ow, wiec podglad i eksport pokazuja to samo.
+        let losslessStarts = exportableKeyframes(
+            keyframes,
+            maxStart: maxStart,
+            frameStep: metadata.frameStep
+        )
+        let losslessWindows = scoreWindows(
+            starts: losslessStarts,
+            samples: samples,
+            stats: stats,
+            waveform: waveform,
+            duration: duration
+        )
+        let selectedLossless = nonMaxSuppression(
+            windows: losslessWindows,
+            separation: separation,
+            limit: maxCandidates
+        )
+        var losslessCandidates = refineCandidates(
+            starts: selectedLossless,
+            url: url,
+            duration: duration,
+            stats: stats,
+            waveform: waveform,
+            weights: weights
+        )
+        losslessCandidates = losslessCandidates.map { candidate in
+            Candidate(
+                start: candidate.start,
+                score: candidate.score,
+                reason: "keyframe · \(candidate.reason)"
+            )
+        }
+
+        if losslessCandidates.isEmpty, let first = losslessStarts.first {
+            losslessCandidates = [
+                Candidate(
+                    start: first,
+                    score: 0,
+                    reason: "keyframe · analiza nie znalazla kandydatow"
+                )
+            ]
+        }
+
         return AnalysisResult(
             candidates: candidates,
+            losslessCandidates: losslessCandidates,
             keyframes: keyframes,
             waveform: waveform,
             sampleCount: samples.count
@@ -271,6 +297,61 @@ enum VideoAnalyzer {
         return (quality, sceneCut)
     }
 
+    private static func scoreWindows(
+        starts: [Double],
+        samples: [CoarseSample],
+        stats: VideoStats,
+        waveform: [Float],
+        duration: Double
+    ) -> [(start: Double, score: Double)] {
+        let audioEnergies = starts.map {
+            AudioWaveform.windowEnergy(waveform: waveform, duration: duration, start: $0, length: 1.0)
+        }
+        let audioRank = Percentiler(values: audioEnergies)
+
+        var windows: [(start: Double, score: Double)] = []
+        for (index, start) in starts.enumerated() {
+            let inWindow = samples.filter { $0.time >= start - 0.02 && $0.time <= start + 1.02 }
+            guard !inWindow.isEmpty else {
+                continue
+            }
+            let imageQ = averageImageQuality(of: inWindow, stats: stats)
+            let faceQ = faceQuality(of: inWindow)
+            let motion = motionQuality(of: inWindow)
+            let audioQ = waveform.isEmpty ? 0.5 : audioRank.rank(audioEnergies[index])
+            var score = 0.38 * imageQ + 0.20 * faceQ + 0.22 * motion.quality + 0.20 * audioQ
+            if motion.sceneCut {
+                score *= 0.25
+            }
+            windows.append((start, score))
+        }
+        return windows
+    }
+
+    private static func exportableKeyframes(
+        _ keyframes: [Double],
+        maxStart: Double,
+        frameStep: Double
+    ) -> [Double] {
+        let tolerance = max(frameStep * 0.5, 0.005)
+        var starts = keyframes
+            .map { max(0, ($0 * 1000).rounded() / 1000) }
+            .filter { $0 <= maxStart + tolerance }
+            .sorted()
+
+        if starts.first.map({ $0 > tolerance }) ?? true {
+            starts.insert(0, at: 0)
+        }
+
+        var cleaned: [Double] = []
+        for start in starts {
+            if cleaned.last.map({ abs($0 - start) > 0.01 }) ?? true {
+                cleaned.append(start)
+            }
+        }
+        return cleaned
+    }
+
     private static func nonMaxSuppression(
         windows: [(start: Double, score: Double)],
         separation: Double,
@@ -290,6 +371,31 @@ enum VideoAnalyzer {
     }
 
     // MARK: - Faza 3: doprecyzowanie
+
+    private static func refineCandidates(
+        starts: [Double],
+        url: URL,
+        duration: Double,
+        stats: VideoStats,
+        waveform: [Float],
+        weights: Weights
+    ) -> [Candidate] {
+        var candidates: [Candidate] = []
+        for start in starts {
+            if let candidate = refine(
+                url: url,
+                start: start,
+                duration: duration,
+                stats: stats,
+                waveform: waveform,
+                weights: weights
+            ) {
+                candidates.append(candidate)
+            }
+        }
+        candidates.sort { $0.score > $1.score }
+        return candidates
+    }
 
     private static func refine(
         url: URL,
