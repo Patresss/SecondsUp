@@ -20,6 +20,13 @@ final class ClipConformer: @unchecked Sendable {
         /// Konformowane klipy dostaja timescale wzorca — rozne timescale
         /// powoduja artefakty zaokraglen edit-list przy sklejaniu passthrough.
         let trackTimescale: Int
+        /// start_time strumienia. Niezerowy (przesuniecie CTS od B-klatek)
+        /// zostawia pusty edit (zamrozona klatke) przy sklejaniu passthrough.
+        let startTime: Double
+
+        var startsCleanly: Bool {
+            abs(startTime) < 0.001
+        }
 
         var fpsBucket: Int {
             ClipConformer.fpsBucket(fps)
@@ -35,6 +42,9 @@ final class ClipConformer: @unchecked Sendable {
             }
             if !colorTransfer.isEmpty {
                 text += " \(colorTransfer)"
+            }
+            if !startsCleanly {
+                text += " · przesuniety start"
             }
             return text
         }
@@ -120,18 +130,23 @@ final class ClipConformer: @unchecked Sendable {
     }
 
     /// Najczestsza kombinacja parametrow jako wzorzec dla folderu.
+    /// Wzorzec wybieramy sposrod klipow z czystym startem (start_time 0) —
+    /// konformacja zawsze daje czysty start, wiec wzorzec z przesunieciem
+    /// prowadzilby do wiecznego "do naprawy".
     static func majorityTarget(of infos: [ClipInfo]) -> ClipInfo? {
-        guard !infos.isEmpty else {
+        let clean = infos.filter { $0.video.startsCleanly }
+        let candidates = clean.isEmpty ? infos : clean
+        guard !candidates.isEmpty else {
             return nil
         }
         var counts: [String: Int] = [:]
-        for info in infos {
+        for info in candidates {
             counts[info.matchKey, default: 0] += 1
         }
         guard let majorityKey = counts.max(by: { $0.value < $1.value })?.key else {
             return nil
         }
-        return infos.first { $0.matchKey == majorityKey }
+        return candidates.first { $0.matchKey == majorityKey }
     }
 
     func probeVideoSignature(of url: URL) throws -> VideoSignature {
@@ -144,7 +159,7 @@ final class ClipConformer: @unchecked Sendable {
                 "-v", "error",
                 "-select_streams", "v:0",
                 "-show_entries",
-                "stream=codec_name,width,height,pix_fmt,color_transfer,color_primaries,color_space,avg_frame_rate,r_frame_rate,time_base",
+                "stream=codec_name,width,height,pix_fmt,color_transfer,color_primaries,color_space,avg_frame_rate,r_frame_rate,time_base,start_time",
                 "-of", "json",
                 url.path
             ]
@@ -161,6 +176,7 @@ final class ClipConformer: @unchecked Sendable {
                 let avgFrameRate: String?
                 let realFrameRate: String?
                 let timeBase: String?
+                let startTime: String?
 
                 enum CodingKeys: String, CodingKey {
                     case codecName = "codec_name"
@@ -173,6 +189,7 @@ final class ClipConformer: @unchecked Sendable {
                     case avgFrameRate = "avg_frame_rate"
                     case realFrameRate = "r_frame_rate"
                     case timeBase = "time_base"
+                    case startTime = "start_time"
                 }
             }
             let streams: [Stream]
@@ -195,7 +212,8 @@ final class ClipConformer: @unchecked Sendable {
             colorPrimaries: stream.colorPrimaries ?? "",
             colorSpace: stream.colorSpace ?? "",
             fps: avgFPS > 0 ? avgFPS : realFPS,
-            trackTimescale: timescale
+            trackTimescale: timescale,
+            startTime: stream.startTime.flatMap(Double.init) ?? 0
         )
     }
 
@@ -271,6 +289,10 @@ final class ClipConformer: @unchecked Sendable {
         if !target.video.pixelFormat.isEmpty {
             filters.append("format=\(target.video.pixelFormat)")
         }
+        // Start dokladnie od zera — ffmpeg inaczej przenosi wejsciowe
+        // przesuniecie timestampow do wyniku (przesuniety start psuje
+        // sklejanie passthrough pusta klatka na granicy).
+        filters.append("setpts=PTS-STARTPTS")
 
         var arguments = [
             "-hide_banner",
@@ -300,6 +322,7 @@ final class ClipConformer: @unchecked Sendable {
                 arguments += ["-map", "1:a:0", "-shortest"]
             }
             arguments += [
+                "-af", "asetpts=PTS-STARTPTS",
                 "-c:a", "aac",
                 "-ar", "\(target.audio.sampleRate)",
                 "-ac", "\(target.audio.channels)",
@@ -309,18 +332,23 @@ final class ClipConformer: @unchecked Sendable {
             arguments += ["-an"]
         }
 
+        // bframes=0: bez reorderingu klatek pierwsze pts = 0 i klip nie ma
+        // edit-listy — wstawia sie do kompozycji bez pustych editow
+        // (zamrozonych klatek na granicach).
         if target.video.codec == "hevc" {
             arguments += [
                 "-c:v", "libx265",
                 "-preset", "medium",
                 "-crf", "14",
+                "-x265-params", "bframes=0",
                 "-tag:v", "hvc1"
             ]
         } else {
             arguments += [
                 "-c:v", "libx264",
                 "-preset", "medium",
-                "-crf", "14"
+                "-crf", "14",
+                "-bf", "0"
             ]
         }
 

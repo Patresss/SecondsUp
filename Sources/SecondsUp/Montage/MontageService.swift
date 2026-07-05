@@ -324,27 +324,48 @@ final class MontageRenderer: @unchecked Sendable {
         for segment in segments {
             try checkCancelled()
             let asset = AVURLAsset(url: segment)
-            let duration = asset.duration
             guard let sourceVideo = asset.tracks(withMediaType: .video).first else {
                 throw MediaError.invalidExport("brak video w \(segment.lastPathComponent)")
             }
-            let range = CMTimeRange(start: .zero, duration: duration)
+
+            // KRYTYCZNE: kursor idzie po dlugosci sciezki VIDEO, nie asset.duration.
+            // asset.duration to maksimum ze sciezek — audio (padding AAC) bywa
+            // 20-90 ms dluzsze od video. Wstawianie wg asset.duration tworzy
+            // puste edity (media time -1) w sciezce video, a QuickTime zamraza
+            // wtedy ostatnia klatke na kazdej granicy klipu — wyglada to jak
+            // zwolnione tempo / przyciecia.
+            let videoRange = sourceVideo.timeRange
             do {
-                try videoTrack.insertTimeRange(range, of: sourceVideo, at: cursor)
+                try videoTrack.insertTimeRange(videoRange, of: sourceVideo, at: cursor)
             } catch {
                 throw MediaError.invalidExport(
                     "nie mozna dolaczyc \(segment.lastPathComponent): \(error.localizedDescription)"
                 )
             }
+
+            // Kursor = faktyczny koniec sciezki po wstawieniu. Zrodlowy track
+            // moze wstawic odrobine mniej, niz deklaruje timeRange — liczenie
+            // kursora z deklaracji zostawialoby pusty edit (zamrozona klatka).
+            let segmentStart = cursor
+            cursor = videoTrack.timeRange.end
+            let segmentDuration = CMTimeSubtract(cursor, segmentStart)
+
             if let audioTrack {
                 if let sourceAudio = asset.tracks(withMediaType: .audio).first {
-                    try? audioTrack.insertTimeRange(range, of: sourceAudio, at: cursor)
+                    // Audio przyciete do dlugosci video — ewentualna luka
+                    // w dzwieku na granicy jest niezauwazalna, luka w obrazie nie.
+                    let audioRange = CMTimeRange(
+                        start: sourceAudio.timeRange.start,
+                        duration: CMTimeMinimum(sourceAudio.timeRange.duration, segmentDuration)
+                    )
+                    try? audioTrack.insertTimeRange(audioRange, of: sourceAudio, at: segmentStart)
                 } else {
                     // Cisza zamiast dzwieku, zeby audio nie rozjechalo sie z obrazem.
-                    audioTrack.insertEmptyTimeRange(CMTimeRange(start: cursor, duration: duration))
+                    audioTrack.insertEmptyTimeRange(
+                        CMTimeRange(start: segmentStart, duration: segmentDuration)
+                    )
                 }
             }
-            cursor = CMTimeAdd(cursor, duration)
         }
 
         guard let export = AVAssetExportSession(
