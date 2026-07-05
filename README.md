@@ -28,6 +28,20 @@ filmu jest natychmiastowy.
 Skroty: `←`/`→` klatka, `⇧←`/`⇧→` ±0.5 s, `spacja` podglad 1 s,
 `⌘R` rekomendacja, `⌘E` eksport.
 
+## Zakladka Naprawa
+
+Klipy zebrane przez caly rok bywaja niejednorodne (inny kodek, rozdzielczosc,
+fps, kolor, audio) — a to psuje bezstratne sklejanie: przyciecia i zwolnione
+tempo na granicach klipow. Zakladka Naprawa:
+
+1. Analizuje wszystkie klipy w folderze i wyznacza **wzorzec** (najczestszy format).
+2. Pokazuje, ktore klipy odstaja i czym.
+3. `Napraw` dopasowuje odstajace klipy wysoka jakoscia (libx265/libx264 CRF 14,
+   konwersja fps przez duplikacje klatek, kolory przez zscale, audio i timescale
+   sciezki do spec wzorca). Oryginaly laduja w podfolderze `_oryginaly/`.
+
+Po naprawie folder skleja sie czysto w kazdym trybie.
+
 ## Zakladka Montaz
 
 1. Wybierz folder z wycietymi sekundami (podpowiadany jest folder eksportu).
@@ -81,4 +95,7 @@ SecondsUp --self-test-export --source film.mov --output ./out --start 2.0
 
 # montaz calego folderu
 SecondsUp --self-test-export --montage --folder ./out --output final.mp4 --music muzyka.m4a
+
+# naprawa (konformacja) klipow w folderze
+SecondsUp --self-test-export --repair --folder ./out
 ```

@@ -8,7 +8,61 @@ enum SelfTest {
         if arguments.contains("--montage") {
             return runMontage(arguments: arguments)
         }
+        if arguments.contains("--repair") {
+            return runRepair(arguments: arguments)
+        }
         return runExport(arguments: arguments)
+    }
+
+    private static func runRepair(arguments: [String]) -> Int {
+        do {
+            let folder = try value(after: "--folder", in: arguments)
+            let folderURL = URL(fileURLWithPath: folder)
+            let conformer = ClipConformer(tools: .detect())
+
+            var infos: [ClipConformer.ClipInfo] = []
+            let contents = try FileManager.default.contentsOfDirectory(
+                at: folderURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+            for url in contents.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+            where MediaService.videoExtensions.contains(url.pathExtension.lowercased()) {
+                infos.append(try conformer.inspect(url))
+            }
+            guard let target = ClipConformer.majorityTarget(of: infos) else {
+                throw MediaError.emptyRender
+            }
+            print("target=\(target.summary)")
+
+            let backupDir = folderURL.appendingPathComponent(RepairModel.backupFolderName)
+            var repaired = 0
+            for info in infos {
+                if info.matchKey == target.matchKey {
+                    print("ok \(info.url.lastPathComponent)")
+                    continue
+                }
+                print("repair \(info.url.lastPathComponent) (\(info.summary))")
+                try FileManager.default.createDirectory(
+                    at: backupDir,
+                    withIntermediateDirectories: true
+                )
+                let temp = folderURL.appendingPathComponent(".conform-\(UUID().uuidString).mov")
+                try conformer.conform(source: info, target: target, to: temp)
+                let backupURL = RepairModel.availableURL(
+                    for: info.url.lastPathComponent,
+                    in: backupDir
+                )
+                try FileManager.default.moveItem(at: info.url, to: backupURL)
+                try FileManager.default.moveItem(at: temp, to: info.url)
+                repaired += 1
+            }
+            print("repaired=\(repaired)")
+            return 0
+        } catch {
+            fputs("\(error.localizedDescription)\n", stderr)
+            return 1
+        }
     }
 
     private static func runAnalyze(arguments: [String]) -> Int {

@@ -23,12 +23,14 @@ struct SecondsUpApp: App {
 
 enum AppTab: Hashable {
     case extract
+    case repair
     case montage
 }
 
 struct MainView: View {
     @StateObject private var extractModel = ExtractModel()
     @StateObject private var montageModel = MontageModel()
+    @StateObject private var repairModel = RepairModel()
     @State private var tab: AppTab = .extract
 
     var body: some View {
@@ -36,6 +38,8 @@ struct MainView: View {
             switch tab {
             case .extract:
                 ExtractView(model: extractModel)
+            case .repair:
+                RepairView(model: repairModel)
             case .montage:
                 MontageView(model: montageModel)
             }
@@ -45,6 +49,8 @@ struct MainView: View {
                 Picker("Tryb", selection: $tab) {
                     Label("Wycinanie", systemImage: "scissors")
                         .tag(AppTab.extract)
+                    Label("Naprawa", systemImage: "wrench.and.screwdriver")
+                        .tag(AppTab.repair)
                     Label("Montaz", systemImage: "film")
                         .tag(AppTab.montage)
                 }
@@ -52,9 +58,16 @@ struct MainView: View {
             }
         }
         .onChange(of: tab) { newTab in
-            if newTab == .montage {
+            switch newTab {
+            case .montage:
                 // Folder eksportu sekund to naturalne zrodlo montazu.
                 montageModel.suggestFolderIfEmpty(extractModel.outputFolder)
+            case .repair:
+                repairModel.suggestFolderIfEmpty(
+                    montageModel.folder ?? extractModel.outputFolder
+                )
+            case .extract:
+                break
             }
         }
     }
