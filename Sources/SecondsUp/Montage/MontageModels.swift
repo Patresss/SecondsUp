@@ -192,7 +192,7 @@ enum CaptionFont: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-enum MontageRenderMode: String, Codable, CaseIterable, Identifiable {
+enum MontageRenderMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case h264
     case proResHQ
     case losslessSmart
@@ -222,9 +222,10 @@ enum MontageRenderMode: String, Codable, CaseIterable, Identifiable {
         case .losslessSmart:
             return "Klipy zgodne z wiekszoscia sa kopiowane bez rekompresji; "
                 + "tylko odstajace (inny kodek/rozdzielczosc/kolor) sa dopasowywane. "
-                + "Pomija napisy, plansze, muzyke."
+                + "Po eksporcie sprawdza czyste dekodowanie. Pomija napisy, plansze, muzyke."
         case .losslessCopy:
             return "Kopiuje klipy bez rekompresji. Wymaga identycznych parametrow wszystkich klipow. "
+                + "Walidacja zatrzyma eksport, jesli wynik nie dekoduje sie czysto. "
                 + "Pomija napisy, plansze, muzyke, zmiane FPS i rozdzielczosci."
         }
     }
@@ -277,6 +278,11 @@ enum RenderQuality: String, Codable, CaseIterable, Identifiable {
 }
 
 struct MontageSettings: Codable, Equatable {
+    var clipDuration = 1.0
+    /// Cichy fallback do ProRes maskowalby bledy trybu bezstratnego
+    /// (i podmienial wynik na re-encode bez wiedzy uzytkownika) — domyslnie OFF.
+    var autoFallbackToProRes = false
+
     var titleEnabled = false
     var titleText = ""
     var titleDuration = 2.0
@@ -315,6 +321,9 @@ struct MontageSettings: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let defaults = MontageSettings()
+        clipDuration = try container.decodeIfPresent(Double.self, forKey: .clipDuration) ?? defaults.clipDuration
+        autoFallbackToProRes = try container.decodeIfPresent(Bool.self, forKey: .autoFallbackToProRes)
+            ?? defaults.autoFallbackToProRes
         titleEnabled = try container.decodeIfPresent(Bool.self, forKey: .titleEnabled) ?? defaults.titleEnabled
         titleText = try container.decodeIfPresent(String.self, forKey: .titleText) ?? defaults.titleText
         titleDuration = try container.decodeIfPresent(Double.self, forKey: .titleDuration) ?? defaults.titleDuration
@@ -415,6 +424,16 @@ enum MontageProject {
             return
         }
         try? data.write(to: url, options: .atomic)
+    }
+}
+
+struct MontageRenderResult: Sendable {
+    let url: URL
+    let renderMode: MontageRenderMode
+    let fallbackReason: String?
+
+    var usedFallback: Bool {
+        fallbackReason != nil
     }
 }
 

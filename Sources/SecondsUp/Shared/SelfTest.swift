@@ -122,6 +122,10 @@ enum SelfTest {
             settings.titleEnabled = true
             settings.titleText = "SecondsUp test"
             settings.titleDuration = 1.0
+            if let durationText = try? value(after: "--clip-duration", in: arguments),
+               let duration = Double(durationText) {
+                settings.clipDuration = duration
+            }
             if let music = try? value(after: "--music", in: arguments) {
                 settings.musicPath = music
             }
@@ -153,8 +157,12 @@ enum SelfTest {
                     print(String(format: "[%3.0f%%] %@", update.fraction * 100, update.stage))
                 }
             )
-            let duration = try renderer.probeDuration(of: result)
-            print("montage=\(result.path)")
+            let duration = try renderer.probeDuration(of: result.url)
+            print("montage=\(result.url.path)")
+            print("mode=\(result.renderMode.rawValue)")
+            if let reason = result.fallbackReason {
+                print("fallback=\(reason)")
+            }
             print(String(format: "duration=%.3f clips=%d", duration, clips.count))
             return 0
         } catch {

@@ -49,9 +49,10 @@ Po naprawie folder skleja sie czysto w kazdym trybie.
    wlacza/wylacza klip, kolejnosc zmieniasz przeciaganiem.
 3. Podglad moze odtwarzac pojedynczy klip albo caly film z aktualna kolejnoscia
    i podgladowym napisem daty.
-4. Opcje: plansza tytulowa i koncowa, **napis z data z nazwy pliku** w wielu
-   formatach, wybor fontu, muzyka z regulacja glosnosci i fade-out, zachowanie
-   dzwieku klipow, rozdzielczosc (4K/1080p/720p/kwadrat/pion) i fps.
+4. Opcje: dokladna dlugosc klipu (domyslnie 1.00 s), plansza tytulowa i
+   koncowa, **napis z data z nazwy pliku** w wielu formatach, wybor fontu,
+   muzyka z regulacja glosnosci i fade-out, zachowanie dzwieku klipow,
+   rozdzielczosc (4K/1080p/720p/kwadrat/pion) i fps.
 5. Tryby renderu:
    - `H.264`: uniwersalny MP4, obraz jest renderowany ponownie;
    - `ProRes HQ`: bardzo wysoka jakosc do archiwum lub dalszego montazu,
@@ -59,14 +60,17 @@ Po naprawie folder skleja sie czysto w kazdym trybie.
    - `Bezstratnie smart`: klipy zgodne z najczestsza sygnatura (kodek,
      rozdzielczosc, pix_fmt, kolor, audio) sa kopiowane bit-w-bit; tylko
      odstajace sa dopasowywane re-encode'em (libx265/libx264 CRF 14,
-     konwersja kolorow zscale, audio do spec wzorca). Idealne, gdy np.
-     kilka klipow z calego roku ma inna rozdzielczosc.
+     konwersja kolorow zscale, audio do spec wzorca). Wynik przechodzi
+     walidacje czystego dekodowania, zeby nie zapisac filmu z uszkodzonym
+     strumieniem HEVC.
    - `Bezstratnie copy`: prawdziwe sklejanie bez rekompresji, ale bez napisow,
      plansz, muzyki, zmiany rozdzielczosci i zmiany fps. Wymaga identycznych
      parametrow wszystkich klipow (kodek, rozdzielczosc, kolor) — aplikacja
-     sprawdza to przed renderem i wypisuje odstajace pliki.
-6. `Renderuj film`: normalizacja klipow → napisy → concat → muzyka → walidacja,
-   z paskiem postepu i mozliwoscia przerwania.
+     sprawdza to przed renderem i po renderze weryfikuje dekodowanie. Przy
+     problemach uzyj `ProRes HQ` albo `H.264`.
+6. `Renderuj film`: kazdy klip jest przycinany do ustawionej dlugosci,
+   normalizacja klipow → napisy → concat → muzyka → walidacja, z paskiem
+   postepu i mozliwoscia przerwania.
 
 Ustawienia projektu (kolejnosc, wykluczenia, muzyka, ...) zapisuja sie w
 `.secondsup-project.json` w folderze klipow.
@@ -94,7 +98,7 @@ SecondsUp --self-test-export --analyze --source film.mov
 SecondsUp --self-test-export --source film.mov --output ./out --start 2.0
 
 # montaz calego folderu
-SecondsUp --self-test-export --montage --folder ./out --output final.mp4 --music muzyka.m4a
+SecondsUp --self-test-export --montage --folder ./out --output final.mp4 --music muzyka.m4a --clip-duration 1.0
 
 # naprawa (konformacja) klipow w folderze
 SecondsUp --self-test-export --repair --folder ./out

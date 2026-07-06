@@ -8,7 +8,6 @@ final class MontageRenderer: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
     private var currentProcess: Process?
-    var currentExport: AVAssetExportSession?
     private let conformer: ClipConformer
 
     init(tools: ToolSet) {
@@ -20,10 +19,8 @@ final class MontageRenderer: @unchecked Sendable {
         lock.lock()
         cancelled = true
         let process = currentProcess
-        let export = currentExport
         lock.unlock()
         process?.terminate()
-        export?.cancelExport()
         conformer.cancel()
     }
 
@@ -40,7 +37,7 @@ final class MontageRenderer: @unchecked Sendable {
         settings: MontageSettings,
         output: URL,
         onProgress: @escaping @Sendable (RenderProgress) -> Void
-    ) throws -> URL {
+    ) throws -> MontageRenderResult {
         guard let ffmpegURL = tools.ffmpegURL else {
             throw MediaError.toolMissing("ffmpeg")
         }
@@ -49,21 +46,51 @@ final class MontageRenderer: @unchecked Sendable {
         }
 
         if settings.renderMode == .losslessCopy {
-            return try renderLosslessCopy(
-                ffmpegURL: ffmpegURL,
-                clips: clips.map(\.url),
-                output: output,
-                onProgress: onProgress
-            )
+            do {
+                let url = try renderLosslessCopy(
+                    ffmpegURL: ffmpegURL,
+                    clips: clips.map(\.url),
+                    clipDuration: settings.safeClipDuration,
+                    output: output,
+                    onProgress: onProgress
+                )
+                return MontageRenderResult(url: url, renderMode: settings.renderMode, fallbackReason: nil)
+            } catch {
+                guard shouldFallbackFromLossless(error, settings: settings) else {
+                    throw error
+                }
+                return try renderProResFallback(
+                    clips: clips,
+                    settings: settings,
+                    output: output,
+                    originalError: error,
+                    onProgress: onProgress
+                )
+            }
         }
 
         if settings.renderMode == .losslessSmart {
-            return try renderLosslessSmart(
-                ffmpegURL: ffmpegURL,
-                clips: clips.map(\.url),
-                output: output,
-                onProgress: onProgress
-            )
+            do {
+                let url = try renderLosslessSmart(
+                    ffmpegURL: ffmpegURL,
+                    clips: clips.map(\.url),
+                    clipDuration: settings.safeClipDuration,
+                    output: output,
+                    onProgress: onProgress
+                )
+                return MontageRenderResult(url: url, renderMode: settings.renderMode, fallbackReason: nil)
+            } catch {
+                guard shouldFallbackFromLossless(error, settings: settings) else {
+                    throw error
+                }
+                return try renderProResFallback(
+                    clips: clips,
+                    settings: settings,
+                    output: output,
+                    originalError: error,
+                    onProgress: onProgress
+                )
+            }
         }
 
         let workDir = FileManager.default.temporaryDirectory
@@ -93,7 +120,7 @@ final class MontageRenderer: @unchecked Sendable {
         }
 
         // Normalizacja klipow + napisy.
-        var expectedClipsDuration = 0.0
+        let expectedClipsDuration = Double(clips.count) * settings.safeClipDuration
         for (index, clip) in clips.enumerated() {
             try checkCancelled()
             onProgress(
@@ -102,7 +129,6 @@ final class MontageRenderer: @unchecked Sendable {
                     fraction: 0.03 + 0.69 * Double(index) / Double(clips.count)
                 )
             )
-            expectedClipsDuration += (try? probeDuration(of: clip.url)) ?? 1.0
             let segmentURL = workDir.appendingPathComponent(
                 String(format: "seg_%04d.%@", index, settings.segmentExtension)
             )
@@ -170,7 +196,7 @@ final class MontageRenderer: @unchecked Sendable {
             expected += settings.endCardDuration
         }
         let actual = try probeDuration(of: renderedURL)
-        let tolerance = max(1.0, expected * 0.03)
+        let tolerance = validationTolerance(for: expected)
         guard abs(actual - expected) <= tolerance else {
             throw MediaError.invalidExport(
                 String(format: "czas %.1fs, oczekiwano ~%.1fs", actual, expected)
@@ -182,14 +208,56 @@ final class MontageRenderer: @unchecked Sendable {
         }
         try FileManager.default.moveItem(at: renderedURL, to: output)
         onProgress(RenderProgress(stage: "Gotowe", fraction: 1.0))
-        return output
+        return MontageRenderResult(url: output, renderMode: settings.renderMode, fallbackReason: nil)
     }
 
     // MARK: - Etapy
 
+    private func renderProResFallback(
+        clips: [(url: URL, caption: String)],
+        settings: MontageSettings,
+        output: URL,
+        originalError: Error,
+        onProgress: @escaping @Sendable (RenderProgress) -> Void
+    ) throws -> MontageRenderResult {
+        try checkCancelled()
+        onProgress(
+            RenderProgress(
+                stage: "Copy nie przeszlo walidacji, renderuje ProRes HQ",
+                fraction: 0.01
+            )
+        )
+        var fallbackSettings = settings
+        fallbackSettings.renderMode = .proResHQ
+        let result = try render(
+            clips: clips,
+            settings: fallbackSettings,
+            output: output,
+            onProgress: onProgress
+        )
+        return MontageRenderResult(
+            url: result.url,
+            renderMode: .proResHQ,
+            fallbackReason: originalError.localizedDescription
+        )
+    }
+
+    private func shouldFallbackFromLossless(_ error: Error, settings: MontageSettings) -> Bool {
+        guard settings.autoFallbackToProRes else {
+            return false
+        }
+        switch error {
+        case MediaError.invalidExport, MediaError.incompatibleClips, MediaError.commandFailed:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func renderLosslessCopy(
         ffmpegURL: URL,
         clips: [URL],
+        clipDuration: Double,
         output: URL,
         onProgress: @escaping @Sendable (RenderProgress) -> Void
     ) throws -> URL {
@@ -199,26 +267,45 @@ final class MontageRenderer: @unchecked Sendable {
         onProgress(RenderProgress(stage: "Sprawdzam zgodnosc klipow", fraction: 0.05))
         try verifyCopyCompatibility(of: clips)
 
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SecondsUp-copy-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: workDir)
+        }
+        let renderedURL = workDir.appendingPathComponent("lossless-copy.mov")
+
         try checkCancelled()
         onProgress(RenderProgress(stage: "Sklejanie bezstratne", fraction: 0.4))
-        if FileManager.default.fileExists(atPath: output.path) {
-            try FileManager.default.removeItem(at: output)
-        }
-        try concatenatePassthrough(segments: clips, to: output, onProgress: onProgress)
+        try concatenatePassthrough(
+            segments: clips,
+            clipDuration: clipDuration,
+            to: renderedURL,
+            onProgress: onProgress
+        )
 
         try checkCancelled()
         onProgress(RenderProgress(stage: "Walidacja", fraction: 0.97))
-        let expected = clips.reduce(0.0) { total, clip in
-            total + ((try? probeDuration(of: clip)) ?? 1.0)
+        if ProcessInfo.processInfo.environment["SU_KEEP_INVALID"] != nil {
+            let debugURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("secondsup-debug-copy.mov")
+            try? FileManager.default.removeItem(at: debugURL)
+            try? FileManager.default.copyItem(at: renderedURL, to: debugURL)
         }
-        let actual = try probeDuration(of: output)
-        let tolerance = max(1.0, expected * 0.05)
+        let expected = Double(clips.count) * clipDuration
+        let actual = try probeDuration(of: renderedURL)
+        let tolerance = validationTolerance(for: expected)
         guard abs(actual - expected) <= tolerance else {
             throw MediaError.invalidExport(
                 String(format: "czas %.1fs, oczekiwano ~%.1fs", actual, expected)
             )
         }
+        try validateDecodable(renderedURL, onProgress: onProgress)
 
+        if FileManager.default.fileExists(atPath: output.path) {
+            try FileManager.default.removeItem(at: output)
+        }
+        try FileManager.default.moveItem(at: renderedURL, to: output)
         onProgress(RenderProgress(stage: "Gotowe", fraction: 1.0))
         return output
     }
@@ -228,6 +315,7 @@ final class MontageRenderer: @unchecked Sendable {
     private func renderLosslessSmart(
         ffmpegURL: URL,
         clips: [URL],
+        clipDuration: Double,
         output: URL,
         onProgress: @escaping @Sendable (RenderProgress) -> Void
     ) throws -> URL {
@@ -269,7 +357,12 @@ final class MontageRenderer: @unchecked Sendable {
                 )
             )
             let conformedURL = workDir.appendingPathComponent(String(format: "conf_%04d.mov", index))
-            try conformer.conform(source: info, target: target, to: conformedURL)
+            try conformer.conform(
+                source: info,
+                target: target,
+                to: conformedURL,
+                duration: clipDuration
+            )
             segments.append(conformedURL)
         }
 
@@ -280,135 +373,478 @@ final class MontageRenderer: @unchecked Sendable {
         // segmenty z innym SPS/PPS.
         try checkCancelled()
         onProgress(RenderProgress(stage: "Sklejanie bezstratne", fraction: 0.85))
-        if FileManager.default.fileExists(atPath: output.path) {
-            try FileManager.default.removeItem(at: output)
-        }
-        try concatenatePassthrough(segments: segments, to: output, onProgress: onProgress)
+        let renderedURL = workDir.appendingPathComponent("lossless-smart.mov")
+        try concatenatePassthrough(
+            segments: segments,
+            clipDuration: clipDuration,
+            to: renderedURL,
+            onProgress: onProgress
+        )
 
         try checkCancelled()
         onProgress(RenderProgress(stage: "Walidacja", fraction: 0.97))
-        let expected = clips.reduce(0.0) { total, clip in
-            total + ((try? probeDuration(of: clip)) ?? 1.0)
-        }
-        let actual = try probeDuration(of: output)
-        let tolerance = max(1.0, expected * 0.05)
+        let expected = Double(clips.count) * clipDuration
+        let actual = try probeDuration(of: renderedURL)
+        let tolerance = validationTolerance(for: expected)
         guard abs(actual - expected) <= tolerance else {
             throw MediaError.invalidExport(
                 String(format: "czas %.1fs, oczekiwano ~%.1fs", actual, expected)
             )
         }
+        try validateDecodable(renderedURL, onProgress: onProgress)
 
+        if FileManager.default.fileExists(atPath: output.path) {
+            try FileManager.default.removeItem(at: output)
+        }
+        try FileManager.default.moveItem(at: renderedURL, to: output)
         onProgress(RenderProgress(stage: "Gotowe", fraction: 1.0))
         return output
     }
 
-    /// Bezstratne sklejanie przez AVMutableComposition + eksport passthrough.
+    /// Bezstratne sklejanie na poziomie PROBEK: AVAssetReader (passthrough,
+    /// bez dekodowania) -> retiming -> AVAssetWriter (passthrough).
+    ///
+    /// Dlaczego nie AVAssetExportSession + AVMutableComposition: eksport
+    /// passthrough kompozycji zapisywal zdublowane, nakladajace sie probki
+    /// (pakiety-cienie z flaga discard) i niemonotoniczny DTS — QuickTime
+    /// dekodowal ~2x wiecej danych i odtwarzal film w zwolnionym tempie.
+    /// Tutaj kazda probka jest kopiowana bit-w-bit dokladnie raz, z jawnie
+    /// policzonym czasem: DTS/PTS monotoniczne z konstrukcji, zero edit-list.
     private func concatenatePassthrough(
         segments: [URL],
+        clipDuration: Double,
         to output: URL,
         onProgress: @escaping @Sendable (RenderProgress) -> Void
     ) throws {
-        let composition = AVMutableComposition()
-        guard let videoTrack = composition.addMutableTrack(
-            withMediaType: .video,
-            preferredTrackID: kCMPersistentTrackID_Invalid
-        ) else {
-            throw MediaError.invalidExport("nie mozna utworzyc sciezki video")
+        if FileManager.default.fileExists(atPath: output.path) {
+            try FileManager.default.removeItem(at: output)
         }
-        let audioTrack = composition.addMutableTrack(
-            withMediaType: .audio,
-            preferredTrackID: kCMPersistentTrackID_Invalid
-        )
 
-        var cursor = CMTime.zero
-        for segment in segments {
-            try checkCancelled()
+        let writer = try AVAssetWriter(outputURL: output, fileType: .mov)
+
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
+        videoInput.expectsMediaDataInRealTime = false
+        writer.add(videoInput)
+
+        // Sciezke audio zakladamy tylko, gdy pierwszy segment ma dzwiek
+        // (po naprawie folder jest jednorodny).
+        let firstAsset = AVURLAsset(url: segments[0])
+        if let firstVideo = firstAsset.tracks(withMediaType: .video).first,
+           firstVideo.naturalTimeScale > 0 {
+            videoInput.mediaTimeScale = firstVideo.naturalTimeScale
+        }
+        let includeAudio = firstAsset.tracks(withMediaType: .audio).first != nil
+        var audioInput: AVAssetWriterInput?
+        if includeAudio {
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            input.expectsMediaDataInRealTime = false
+            writer.add(input)
+            audioInput = input
+        }
+
+        guard writer.startWriting() else {
+            throw MediaError.invalidExport(
+                writer.error?.localizedDescription ?? "nie mozna rozpoczac zapisu"
+            )
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        // Kanoniczny pipeline AVAssetWriter: kazdy input ma pompe
+        // requestMediaDataWhenReady na wlasnej kolejce, karmiona z
+        // blokujacej kolejki probek (backpressure). Polling
+        // isReadyForMoreMediaData bez pompy zawiesza sie na stale.
+        let videoFeed = SampleFeed(capacity: 360)
+        let audioFeed = SampleFeed(capacity: 360)
+        let errorBox = ErrorBox()
+        let pumpsDone = DispatchSemaphore(value: 0)
+        var pumpCount = 1
+
+        Self.pump(
+            input: videoInput,
+            feed: videoFeed,
+            label: "video",
+            writer: writer,
+            errorBox: errorBox,
+            done: pumpsDone
+        )
+        if let audioInput {
+            pumpCount += 1
+            Self.pump(
+                input: audioInput,
+                feed: audioFeed,
+                label: "audio",
+                writer: writer,
+                errorBox: errorBox,
+                done: pumpsDone
+            )
+        }
+
+        func fail(_ message: String) -> MediaError {
+            videoFeed.finish()
+            audioFeed.finish()
+            // Daj pompom zejsc, zanim anulujemy writer — markAsFinished
+            // po cancelWriting potrafi rzucic wyjatkiem Objective-C.
+            for _ in 0..<pumpCount {
+                _ = pumpsDone.wait(timeout: .now() + 2)
+            }
+            writer.cancelWriting()
+            return MediaError.invalidExport(message)
+        }
+
+        let clipLimit = CMTime(seconds: clipDuration, preferredTimescale: 600)
+        var videoCursor = CMTime.zero
+        var audioCursor = CMTime.zero
+        var lastVideoDTS = CMTime.invalid
+
+        for (index, segment) in segments.enumerated() {
+            if isCancelled {
+                _ = fail("przerwane")
+                throw MediaError.cancelled
+            }
+            onProgress(
+                RenderProgress(
+                    stage: "Sklejanie \(index + 1)/\(segments.count)",
+                    fraction: 0.85 + 0.10 * Double(index) / Double(segments.count)
+                )
+            )
+
             let asset = AVURLAsset(url: segment)
-            guard let sourceVideo = asset.tracks(withMediaType: .video).first else {
-                throw MediaError.invalidExport("brak video w \(segment.lastPathComponent)")
+            guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+                throw fail("brak video w \(segment.lastPathComponent)")
+            }
+            guard let reader = try? AVAssetReader(asset: asset) else {
+                throw fail("nie mozna czytac \(segment.lastPathComponent)")
             }
 
-            // KRYTYCZNE: kursor idzie po dlugosci sciezki VIDEO, nie asset.duration.
-            // asset.duration to maksimum ze sciezek — audio (padding AAC) bywa
-            // 20-90 ms dluzsze od video. Wstawianie wg asset.duration tworzy
-            // puste edity (media time -1) w sciezce video, a QuickTime zamraza
-            // wtedy ostatnia klatke na kazdej granicy klipu — wyglada to jak
-            // zwolnione tempo / przyciecia.
-            let videoRange = sourceVideo.timeRange
-            do {
-                try videoTrack.insertTimeRange(videoRange, of: sourceVideo, at: cursor)
-            } catch {
-                throw MediaError.invalidExport(
-                    "nie mozna dolaczyc \(segment.lastPathComponent): \(error.localizedDescription)"
+            let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+            videoOutput.alwaysCopiesSampleData = false
+            reader.add(videoOutput)
+
+            var audioOutput: AVAssetReaderTrackOutput?
+            if includeAudio, let audioTrack = asset.tracks(withMediaType: .audio).first {
+                let out = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+                out.alwaysCopiesSampleData = false
+                reader.add(out)
+                audioOutput = out
+            }
+            guard reader.startReading() else {
+                throw fail(
+                    "blad czytania \(segment.lastPathComponent): "
+                        + (reader.error?.localizedDescription ?? "?")
                 )
             }
 
-            // Kursor = faktyczny koniec sciezki po wstawieniu. Zrodlowy track
-            // moze wstawic odrobine mniej, niz deklaruje timeRange — liczenie
-            // kursora z deklaracji zostawialoby pusty edit (zamrozona klatka).
-            let segmentStart = cursor
-            cursor = videoTrack.timeRange.end
-            let segmentDuration = CMTimeSubtract(cursor, segmentStart)
+            // --- VIDEO: czytaj, przestempluj i wrzucaj do pompy writera.
+            var clipFirstPTS = CMTime.invalid
+            var clipVideoEnd = CMTime.zero  // koniec klipu w osi klipu (od 0)
+            while let sample = videoOutput.copyNextSampleBuffer() {
+                if isCancelled {
+                    reader.cancelReading()
+                    _ = fail("przerwane")
+                    throw MediaError.cancelled
+                }
+                if let message = errorBox.message {
+                    reader.cancelReading()
+                    throw fail(message)
+                }
+                let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                if !clipFirstPTS.isValid {
+                    clipFirstPTS = pts
+                }
+                let rel = CMTimeSubtract(pts, clipFirstPTS)
+                // Przyciecie klipu do zadanej dlugosci (granica probki).
+                if CMTimeCompare(rel, clipLimit) >= 0 {
+                    break
+                }
+                let delta = CMTimeSubtract(videoCursor, clipFirstPTS)
+                guard let retimed = Self.retimed(sample, by: delta, clampDTSAfter: lastVideoDTS) else {
+                    reader.cancelReading()
+                    throw fail("retiming probki w \(segment.lastPathComponent)")
+                }
+                lastVideoDTS = CMSampleBufferGetDecodeTimeStamp(retimed).isValid
+                    ? CMSampleBufferGetDecodeTimeStamp(retimed)
+                    : CMSampleBufferGetPresentationTimeStamp(retimed)
+                videoFeed.push(retimed)
 
-            if let audioTrack {
-                if let sourceAudio = asset.tracks(withMediaType: .audio).first {
-                    // Audio przyciete do dlugosci video — ewentualna luka
-                    // w dzwieku na granicy jest niezauwazalna, luka w obrazie nie.
-                    let audioRange = CMTimeRange(
-                        start: sourceAudio.timeRange.start,
-                        duration: CMTimeMinimum(sourceAudio.timeRange.duration, segmentDuration)
-                    )
-                    try? audioTrack.insertTimeRange(audioRange, of: sourceAudio, at: segmentStart)
-                } else {
-                    // Cisza zamiast dzwieku, zeby audio nie rozjechalo sie z obrazem.
-                    audioTrack.insertEmptyTimeRange(
-                        CMTimeRange(start: segmentStart, duration: segmentDuration)
-                    )
+                var duration = CMSampleBufferGetDuration(sample)
+                if !duration.isValid || duration == .zero {
+                    duration = CMTime(value: 1, timescale: videoTrack.naturalTimeScale)
+                }
+                clipVideoEnd = CMTimeAdd(rel, duration)
+            }
+
+            let clipVideoEndGlobal = CMTimeAdd(videoCursor, clipVideoEnd)
+
+            // --- AUDIO: pakiety CIAGLE (bez dziur), adaptacyjnie dobierana
+            // liczba, by globalnie |audio - video| <= ~1 pakiet AAC.
+            if let audioOutput {
+                // Pozycyjnie wg ZRODLOWYCH pts (odporne na bufory z zepsutym
+                // duration): pakiet wchodzi tylko, gdy jego pozycja wzgledem
+                // pierwszego pts miesci sie w budzecie klipu. Budzet = koniec
+                // video minus kursor audio, wiec drift nigdy sie nie kumuluje.
+                // Delta liczona RAZ na klip — per bufor podwajalaby przesuniecie.
+                let clipAudioStart = audioCursor
+                let budget = CMTimeSubtract(clipVideoEndGlobal, clipAudioStart)
+                var clipAudioDelta = CMTime.invalid
+                var clipFirstAudioPTS = CMTime.invalid
+                var lastEnd = CMTime.zero  // koniec audio w osi klipu
+                while let sample = audioOutput.copyNextSampleBuffer() {
+                    if isCancelled {
+                        reader.cancelReading()
+                        _ = fail("przerwane")
+                        throw MediaError.cancelled
+                    }
+                    if let message = errorBox.message {
+                        reader.cancelReading()
+                        throw fail(message)
+                    }
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                    if !clipFirstAudioPTS.isValid {
+                        clipFirstAudioPTS = pts
+                        clipAudioDelta = CMTimeSubtract(clipAudioStart, pts)
+                    }
+                    let rel = CMTimeSubtract(pts, clipFirstAudioPTS)
+                    // Pakiety sprzed startu albo poza budzetem — pomijamy.
+                    if rel.seconds < 0 {
+                        continue
+                    }
+                    if CMTimeCompare(rel, budget) >= 0 {
+                        break
+                    }
+                    var duration = CMSampleBufferGetDuration(sample)
+                    if !duration.isValid || duration == .zero {
+                        // Typowy pakiet AAC jako bezpieczne przyblizenie.
+                        duration = CMTime(value: 1024, timescale: 48000)
+                    }
+                    let end = CMTimeAdd(rel, duration)
+                    if CMTimeSubtract(end, budget).seconds > 0.012 {
+                        break
+                    }
+                    guard let retimed = Self.retimed(sample, by: clipAudioDelta, clampDTSAfter: .invalid) else {
+                        reader.cancelReading()
+                        throw fail("retiming audio w \(segment.lastPathComponent)")
+                    }
+                    audioFeed.push(retimed)
+                    if CMTimeCompare(end, lastEnd) > 0 {
+                        lastEnd = end
+                    }
+                }
+                audioCursor = CMTimeAdd(clipAudioStart, lastEnd)
+            }
+
+            reader.cancelReading()
+            videoCursor = clipVideoEndGlobal
+        }
+
+        // Koniec strumieni: pompy dokoncza kolejki i oznacza inputy.
+        videoFeed.finish()
+        audioFeed.finish()
+        for _ in 0..<pumpCount {
+            while pumpsDone.wait(timeout: .now() + 0.25) == .timedOut {
+                if isCancelled {
+                    writer.cancelWriting()
+                    throw MediaError.cancelled
+                }
+                if let message = errorBox.message {
+                    writer.cancelWriting()
+                    throw MediaError.invalidExport(message)
                 }
             }
         }
-
-        guard let export = AVAssetExportSession(
-            asset: composition,
-            presetName: AVAssetExportPresetPassthrough
-        ) else {
-            throw MediaError.invalidExport("passthrough eksport niedostepny")
+        if isCancelled {
+            writer.cancelWriting()
+            throw MediaError.cancelled
         }
-        export.outputURL = output
-        export.outputFileType = .mov
+        if let message = errorBox.message {
+            writer.cancelWriting()
+            throw MediaError.invalidExport(message)
+        }
 
-        lock.lock()
-        currentExport = export
-        lock.unlock()
-        defer {
+        let finished = DispatchSemaphore(value: 0)
+        writer.finishWriting {
+            finished.signal()
+        }
+        finished.wait()
+
+        guard writer.status == .completed else {
+            throw MediaError.invalidExport(
+                writer.error?.localizedDescription ?? "zapis nie powiodl sie"
+            )
+        }
+    }
+
+    /// Blokujaca kolejka probek producent -> pompa writera (backpressure).
+    private final class SampleFeed {
+        private let condition = NSCondition()
+        private var items: [CMSampleBuffer] = []
+        private var finished = false
+        private let capacity: Int
+
+        init(capacity: Int) {
+            self.capacity = capacity
+        }
+
+        func push(_ sample: CMSampleBuffer) {
+            condition.lock()
+            while items.count >= capacity && !finished {
+                condition.wait()
+            }
+            if !finished {
+                items.append(sample)
+            }
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        func finish() {
+            condition.lock()
+            finished = true
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        /// Blokuje az do probki albo konca strumienia (nil).
+        func next() -> CMSampleBuffer? {
+            condition.lock()
+            defer { condition.unlock() }
+            while items.isEmpty && !finished {
+                condition.wait()
+            }
+            guard !items.isEmpty else {
+                return nil
+            }
+            let sample = items.removeFirst()
+            condition.broadcast()
+            return sample
+        }
+    }
+
+    private final class ErrorBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: String?
+
+        var message: String? {
             lock.lock()
-            currentExport = nil
+            defer { lock.unlock() }
+            return stored
+        }
+
+        func set(_ message: String) {
+            lock.lock()
+            if stored == nil {
+                stored = message
+            }
             lock.unlock()
         }
+    }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        export.exportAsynchronously {
-            semaphore.signal()
+    /// Pompa writera: requestMediaDataWhenReady na wlasnej kolejce,
+    /// karmiona z SampleFeed. Sygnalizuje `done` po markAsFinished.
+    private static func pump(
+        input: AVAssetWriterInput,
+        feed: SampleFeed,
+        label: String,
+        writer: AVAssetWriter,
+        errorBox: ErrorBox,
+        done: DispatchSemaphore
+    ) {
+        let queue = DispatchQueue(label: "secondsup.writer.\(label)")
+        input.requestMediaDataWhenReady(on: queue) {
+            while input.isReadyForMoreMediaData {
+                guard let sample = feed.next() else {
+                    input.markAsFinished()
+                    done.signal()
+                    return
+                }
+                if !input.append(sample) {
+                    errorBox.set(
+                        "zapis \(label): "
+                            + (writer.error?.localizedDescription ?? "blad writera")
+                    )
+                    feed.finish()
+                    input.markAsFinished()
+                    done.signal()
+                    return
+                }
+            }
         }
-        while semaphore.wait(timeout: .now() + 0.25) == .timedOut {
-            onProgress(
-                RenderProgress(
-                    stage: "Sklejanie bezstratne",
-                    fraction: 0.85 + 0.11 * Double(export.progress)
+    }
+
+    /// Kopia probki z czasami przesunietymi o delte. DTS jest dodatkowo
+    /// pilnowany, by byl scisle rosnacy (wymog muxera).
+    private static func retimed(
+        _ sample: CMSampleBuffer,
+        by delta: CMTime,
+        clampDTSAfter lastDTS: CMTime
+    ) -> CMSampleBuffer? {
+        var count = 0
+        let queryStatus = CMSampleBufferGetSampleTimingInfoArray(
+            sample,
+            entryCount: 0,
+            arrayToFill: nil,
+            entriesNeededOut: &count
+        )
+
+        var infos: [CMSampleTimingInfo]
+        if queryStatus == noErr, count > 0 {
+            infos = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+            let fillStatus = CMSampleBufferGetSampleTimingInfoArray(
+                sample,
+                entryCount: count,
+                arrayToFill: &infos,
+                entriesNeededOut: nil
+            )
+            guard fillStatus == noErr else {
+                return nil
+            }
+        } else {
+            // Bufory audio (wiele pakietow AAC o rownym czasie) czesto nie
+            // wystawiaja tablicy timingow — jeden wpis obowiazuje wszystkie
+            // probki z sekwencyjnymi PTS co `duration`.
+            let sampleCount = max(1, CMSampleBufferGetNumSamples(sample))
+            let total = CMSampleBufferGetDuration(sample)
+            let perSample = total.isValid && total.value > 0
+                ? CMTimeMultiplyByRatio(total, multiplier: 1, divisor: Int32(sampleCount))
+                : CMSampleBufferGetDuration(sample)
+            infos = [
+                CMSampleTimingInfo(
+                    duration: perSample,
+                    presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
+                    decodeTimeStamp: .invalid
                 )
-            )
+            ]
         }
 
-        switch export.status {
-        case .completed:
-            return
-        case .cancelled:
-            throw MediaError.cancelled
-        default:
-            throw MediaError.invalidExport(
-                export.error?.localizedDescription ?? "eksport passthrough nie powiodl sie"
-            )
+        var previousDTS = lastDTS
+        for index in infos.indices {
+            if infos[index].presentationTimeStamp.isValid {
+                infos[index].presentationTimeStamp =
+                    CMTimeAdd(infos[index].presentationTimeStamp, delta)
+            }
+            if infos[index].decodeTimeStamp.isValid {
+                var dts = CMTimeAdd(infos[index].decodeTimeStamp, delta)
+                // Scisla monotonicznosc DTS; nigdy powyzej PTS.
+                if previousDTS.isValid, CMTimeCompare(dts, previousDTS) <= 0 {
+                    let bumped = CMTimeAdd(
+                        previousDTS,
+                        CMTime(value: 1, timescale: previousDTS.timescale)
+                    )
+                    dts = CMTimeMinimum(bumped, infos[index].presentationTimeStamp)
+                }
+                infos[index].decodeTimeStamp = dts
+                previousDTS = dts
+            }
         }
+
+        var result: CMSampleBuffer?
+        CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: sample,
+            sampleTimingEntryCount: infos.count,
+            sampleTimingArray: &infos,
+            sampleBufferOut: &result
+        )
+        return result
     }
 
     /// Re-encode pojedynczego klipu do parametrow wzorca (kodek, rozdzielczosc,
@@ -490,6 +926,7 @@ final class MontageRenderer: @unchecked Sendable {
             arguments += ["-an"]
         }
 
+        arguments += ["-t", String(format: "%.3f", settings.safeClipDuration)]
         arguments += videoEncodingArguments(settings: settings)
         arguments += [output.path]
 
@@ -699,6 +1136,85 @@ final class MontageRenderer: @unchecked Sendable {
         return !probe.streams.isEmpty
     }
 
+    private func validationTolerance(for expected: Double) -> Double {
+        max(0.35, expected * 0.01)
+    }
+
+    /// Walidacja przez PELNE natywne dekodowanie (AVAssetReader/VideoToolbox —
+    /// dokladnie ten sam stack, ktorym gra QuickTime). ffmpeg nie nadaje sie
+    /// do walidacji plikow multi-stsd (zglasza pozorne bledy SPS mimo
+    /// poprawnego odtwarzania w QuickTime).
+    private func validateDecodable(
+        _ url: URL,
+        onProgress: @escaping @Sendable (RenderProgress) -> Void
+    ) throws {
+        try checkCancelled()
+        let asset = AVURLAsset(url: url)
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            throw MediaError.invalidExport("wynik nie ma sciezki video")
+        }
+        let expectedDuration = asset.duration.seconds
+        guard let reader = try? AVAssetReader(asset: asset) else {
+            throw MediaError.invalidExport("wyniku nie da sie otworzyc do dekodowania")
+        }
+        let output = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String:
+                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            ]
+        )
+        output.alwaysCopiesSampleData = false
+        reader.add(output)
+        guard reader.startReading() else {
+            throw MediaError.invalidExport(
+                "dekodowanie wyniku nie startuje: "
+                    + (reader.error?.localizedDescription ?? "?")
+            )
+        }
+
+        var decodedFrames = 0
+        var lastPTS = CMTime.zero
+        while let sample = output.copyNextSampleBuffer() {
+            if isCancelled {
+                reader.cancelReading()
+                throw MediaError.cancelled
+            }
+            if CMSampleBufferGetNumSamples(sample) > 0 {
+                decodedFrames += 1
+                let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                if pts.isValid {
+                    lastPTS = pts
+                }
+            }
+            if decodedFrames % 600 == 0, expectedDuration > 0 {
+                onProgress(
+                    RenderProgress(
+                        stage: "Walidacja dekodowania",
+                        fraction: 0.97 + 0.025 * min(1, lastPTS.seconds / expectedDuration)
+                    )
+                )
+            }
+        }
+
+        if reader.status == .failed {
+            throw MediaError.invalidExport(
+                "wynik nie dekoduje sie czysto: "
+                    + (reader.error?.localizedDescription ?? "blad dekodera")
+            )
+        }
+        guard decodedFrames > 0, lastPTS.seconds > expectedDuration - 1.0 else {
+            throw MediaError.invalidExport(
+                String(
+                    format: "dekodowanie urwalo sie na %.1fs z %.1fs (%d klatek)",
+                    lastPTS.seconds,
+                    expectedDuration,
+                    decodedFrames
+                )
+            )
+        }
+    }
+
     private func checkCancelled() throws {
         if isCancelled {
             throw MediaError.cancelled
@@ -734,6 +1250,10 @@ final class MontageRenderer: @unchecked Sendable {
 }
 
 private extension MontageSettings {
+    var safeClipDuration: Double {
+        min(10.0, max(0.1, clipDuration))
+    }
+
     var segmentExtension: String {
         renderMode == .proResHQ ? "mov" : "mp4"
     }

@@ -263,7 +263,8 @@ final class ClipConformer: @unchecked Sendable {
     func conform(
         source: ClipInfo,
         target: ClipInfo,
-        to output: URL
+        to output: URL,
+        duration: Double? = nil
     ) throws {
         guard let ffmpegURL = tools.ffmpegURL else {
             throw MediaError.toolMissing("ffmpeg")
@@ -330,6 +331,10 @@ final class ClipConformer: @unchecked Sendable {
             ]
         } else {
             arguments += ["-an"]
+        }
+
+        if let duration {
+            arguments += ["-t", String(format: "%.3f", min(10.0, max(0.1, duration)))]
         }
 
         // bframes=0: bez reorderingu klatek pierwsze pts = 0 i klip nie ma

@@ -76,6 +76,12 @@ struct MontageView: View {
                     .padding(.bottom, 10)
             }
 
+            if !model.duplicateGroups.isEmpty {
+                DuplicateDaysBar(groups: model.duplicateGroups)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 10)
+            }
+
             Divider()
 
             if model.clips.isEmpty {
@@ -409,6 +415,23 @@ struct MontageView: View {
             Text("Wyjscie")
                 .font(.headline)
 
+            HStack(spacing: 12) {
+                Stepper(
+                    value: $model.settings.clipDuration,
+                    in: 0.5...3.0,
+                    step: 0.1
+                ) {
+                    Text("Dlugosc klipu")
+                }
+                Text(model.clipDurationText)
+                    .monospacedDigit()
+                    .frame(width: 54, alignment: .trailing)
+                Text(model.expectedRenderSummary)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .font(.callout)
+
             HStack(spacing: 16) {
                 Picker("Tryb", selection: $model.settings.renderMode) {
                     ForEach(MontageRenderMode.allCases) { mode in
@@ -474,7 +497,7 @@ struct MontageView: View {
 
                 Spacer()
             } else {
-                Text("\(model.includedClips.count) klipow · ~\(model.totalDurationText)")
+                Text("\(model.includedClips.count) klipow · \(model.clipDurationText)/klip · ~\(model.totalDurationText)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
 
@@ -567,6 +590,64 @@ private struct CoverageBar: View {
         }
         .padding(14)
         .frame(width: 180)
+    }
+}
+
+private struct DuplicateDaysBar: View {
+    let groups: [DuplicateDayGroup]
+    @State private var showDetails = false
+
+    private var extraClipCount: Int {
+        groups.reduce(0) { total, group in
+            total + max(0, group.files.count - 1)
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "rectangle.stack.badge.plus")
+                .foregroundStyle(.blue)
+            Text("\(groups.count) dni z wieloma klipami")
+                .font(.caption.weight(.semibold))
+            Text("+\(extraClipCount) dodatkowych sekund")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("pokaz") {
+                showDetails.toggle()
+            }
+            .buttonStyle(.plain)
+            .font(.caption.weight(.semibold))
+            .popover(isPresented: $showDetails) {
+                duplicateList
+            }
+        }
+    }
+
+    private var duplicateList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Dni z kilkoma klipami")
+                .font(.headline)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(groups) { group in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(group.date)
+                                .font(.callout.weight(.semibold).monospacedDigit())
+                            ForEach(group.files, id: \.self) { file in
+                                Text(file)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 320)
+        }
+        .padding(14)
+        .frame(width: 280)
     }
 }
 

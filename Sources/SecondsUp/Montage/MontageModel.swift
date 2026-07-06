@@ -19,6 +19,13 @@ enum MontagePreviewMode: String, CaseIterable, Identifiable {
     }
 }
 
+struct DuplicateDayGroup: Identifiable {
+    let date: String
+    let files: [String]
+
+    var id: String { date }
+}
+
 @MainActor
 final class MontageModel: ObservableObject {
     @Published var folder: URL?
@@ -72,7 +79,7 @@ final class MontageModel: ObservableObject {
     }
 
     var totalDurationText: String {
-        var total = Double(includedClips.count)
+        var total = expectedClipsDuration
         if settings.titleEnabled && !settings.titleText.isEmpty {
             total += settings.titleDuration
         }
@@ -84,9 +91,31 @@ final class MontageModel: ObservableObject {
         return String(format: "%d:%02d", minutes, seconds)
     }
 
+    var expectedClipsDuration: Double {
+        Double(includedClips.count) * max(0.1, settings.clipDuration)
+    }
+
+    var clipDurationText: String {
+        String(format: "%.2fs", max(0.1, settings.clipDuration))
+    }
+
+    var expectedRenderSummary: String {
+        "\(includedClips.count) klipow x \(clipDurationText) = \(formatDuration(expectedClipsDuration))"
+    }
+
     /// Pokrycie dni: ile dni w zakresie ma swoja sekunde, ktorych brakuje.
     var coverage: DayCoverage? {
         DayCoverage.compute(dates: clips.map(\.captionText))
+    }
+
+    var duplicateGroups: [DuplicateDayGroup] {
+        let grouped = Dictionary(grouping: clips) { clip in
+            DateParser.dateString(from: clip.captionText) ?? clip.captionText
+        }
+        return grouped
+            .filter { $0.value.count > 1 }
+            .map { DuplicateDayGroup(date: $0.key, files: $0.value.map(\.fileName).sorted()) }
+            .sorted { $0.date < $1.date }
     }
 
     /// Napis dla klipu wg wybranego formatu daty.
@@ -138,6 +167,13 @@ final class MontageModel: ObservableObject {
         formatter.locale = Locale(identifier: "pl_PL")
         formatter.timeZone = TimeZone(identifier: "UTC")
         return formatter
+    }
+
+    private func formatDuration(_ duration: Double) -> String {
+        let total = Int(duration.rounded())
+        let minutes = total / 60
+        let seconds = total % 60
+        return String(format: "%d:%02d", minutes, seconds)
     }
 
     /// Proponuje tytul na podstawie zakresu dat klipow, np. "Czerwiec 2026".
@@ -444,8 +480,13 @@ final class MontageModel: ObservableObject {
                 guard let self else {
                     return
                 }
-                self.lastOutput = result
-                self.statusMessage = "Zapisano: \(result.path)"
+                self.lastOutput = result.url
+                if let reason = result.fallbackReason {
+                    self.statusMessage = "Zapisano: \(result.url.path) "
+                        + "(uzyto \(result.renderMode.label) — \(reason))"
+                } else {
+                    self.statusMessage = "Zapisano: \(result.url.path)"
+                }
             } catch MediaError.cancelled {
                 self?.statusMessage = "Render przerwany."
             } catch {
