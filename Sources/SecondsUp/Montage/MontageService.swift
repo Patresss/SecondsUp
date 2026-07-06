@@ -401,99 +401,124 @@ final class MontageRenderer: @unchecked Sendable {
         return output
     }
 
-    /// Bezstratne sklejanie na poziomie PROBEK: AVAssetReader (passthrough,
-    /// bez dekodowania) -> retiming -> AVAssetWriter (passthrough).
+    /// Bezstratne sklejanie na poziomie PROBEK, w trzech przebiegach:
     ///
-    /// Dlaczego nie AVAssetExportSession + AVMutableComposition: eksport
-    /// passthrough kompozycji zapisywal zdublowane, nakladajace sie probki
-    /// (pakiety-cienie z flaga discard) i niemonotoniczny DTS — QuickTime
-    /// dekodowal ~2x wiecej danych i odtwarzal film w zwolnionym tempie.
-    /// Tutaj kazda probka jest kopiowana bit-w-bit dokladnie raz, z jawnie
-    /// policzonym czasem: DTS/PTS monotoniczne z konstrukcji, zero edit-list.
+    /// 1. Writer #1: sama sciezka VIDEO (jeden input -> zero problemow
+    ///    z przeplotem A/V, ktore zakleszczaly writer dwuwejsciowy).
+    /// 2. Writer #2: sama sciezka AUDIO do .m4a (budzet per klip wyliczony
+    ///    w przebiegu 1 pilnuje globalnej synchronizacji A/V).
+    /// 3. Zlaczenie sciezek kompozycja + eksport passthrough — po JEDNYM
+    ///    segmencie na sciezke, wiec passthrough nie ma czego zepsuc
+    ///    (probki-cienie powstawaly przy wielu segmentach).
+    ///
+    /// Dlaczego nie AVAssetExportSession na 168 segmentach: eksport
+    /// passthrough takiej kompozycji zapisywal zdublowane, nakladajace sie
+    /// probki (pakiety-cienie z flaga discard) i niemonotoniczny DTS —
+    /// QuickTime dekodowal ~2x wiecej danych i gral w zwolnionym tempie.
+    /// Dlaczego nie ffmpeg concat -c copy: jeden globalny naglowek SPS/PPS
+    /// psuje segmenty z innego enkodera. Tutaj kazda probka jest kopiowana
+    /// bit-w-bit dokladnie raz, z jawnie policzonym czasem: DTS/PTS
+    /// monotoniczne i CIAGLE z konstrukcji — zero edit-list w obu sciezkach.
     private func concatenatePassthrough(
         segments: [URL],
         clipDuration: Double,
         to output: URL,
         onProgress: @escaping @Sendable (RenderProgress) -> Void
     ) throws {
-        if FileManager.default.fileExists(atPath: output.path) {
-            try FileManager.default.removeItem(at: output)
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SecondsUp-mux-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: workDir)
         }
 
-        let writer = try AVAssetWriter(outputURL: output, fileType: .mov)
-
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
-        videoInput.expectsMediaDataInRealTime = false
-        writer.add(videoInput)
-
-        // Sciezke audio zakladamy tylko, gdy pierwszy segment ma dzwiek
-        // (po naprawie folder jest jednorodny).
         let firstAsset = AVURLAsset(url: segments[0])
-        if let firstVideo = firstAsset.tracks(withMediaType: .video).first,
-           firstVideo.naturalTimeScale > 0 {
-            videoInput.mediaTimeScale = firstVideo.naturalTimeScale
-        }
         let includeAudio = firstAsset.tracks(withMediaType: .audio).first != nil
-        var audioInput: AVAssetWriterInput?
+        let clipLimit = CMTime(seconds: clipDuration, preferredTimescale: 600)
+
+        // Przebieg 1: VIDEO. Zapamietujemy faktyczny koniec kazdego klipu —
+        // to budzety audio dla przebiegu 2.
+        onProgress(RenderProgress(stage: "Sklejanie video", fraction: 0.85))
+        let videoURL = workDir.appendingPathComponent("video.mov")
+        let clipVideoEnds = try writeVideoTrack(
+            segments: segments,
+            clipLimit: clipLimit,
+            to: videoURL,
+            onProgress: onProgress
+        )
+
+        // Przebieg 2: AUDIO.
+        var audioURL: URL?
         if includeAudio {
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
-            input.expectsMediaDataInRealTime = false
-            writer.add(input)
-            audioInput = input
+            onProgress(RenderProgress(stage: "Sklejanie audio", fraction: 0.93))
+            let url = workDir.appendingPathComponent("audio.mov")
+            try writeAudioTrack(
+                segments: segments,
+                clipVideoEnds: clipVideoEnds,
+                to: url
+            )
+            audioURL = url
         }
 
+        if ProcessInfo.processInfo.environment["SU_KEEP_INVALID"] != nil {
+            let debugDir = FileManager.default.temporaryDirectory
+            try? FileManager.default.removeItem(at: debugDir.appendingPathComponent("su-video.mov"))
+            try? FileManager.default.copyItem(
+                at: videoURL,
+                to: debugDir.appendingPathComponent("su-video.mov")
+            )
+            if let audioURL {
+                try? FileManager.default.removeItem(at: debugDir.appendingPathComponent("su-audio.mov"))
+                try? FileManager.default.copyItem(
+                    at: audioURL,
+                    to: debugDir.appendingPathComponent("su-audio.mov")
+                )
+            }
+        }
+
+        // Przebieg 3: zlaczenie sciezek (po jednym segmencie na sciezke).
+        try checkCancelled()
+        onProgress(RenderProgress(stage: "Laczenie sciezek", fraction: 0.95))
+        try mergeTracks(videoURL: videoURL, audioURL: audioURL, to: output)
+    }
+
+    /// Zapisuje sama sciezke video (bit-exact, retiming na wspolna os).
+    /// Zwraca globalne konce video kolejnych klipow.
+    private func writeVideoTrack(
+        segments: [URL],
+        clipLimit: CMTime,
+        to output: URL,
+        onProgress: @escaping @Sendable (RenderProgress) -> Void
+    ) throws -> [CMTime] {
+        let writer = try AVAssetWriter(outputURL: output, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
+        input.expectsMediaDataInRealTime = false
+        if let firstVideo = AVURLAsset(url: segments[0]).tracks(withMediaType: .video).first,
+           firstVideo.naturalTimeScale > 0 {
+            input.mediaTimeScale = firstVideo.naturalTimeScale
+        }
+        writer.add(input)
         guard writer.startWriting() else {
             throw MediaError.invalidExport(
-                writer.error?.localizedDescription ?? "nie mozna rozpoczac zapisu"
+                writer.error?.localizedDescription ?? "nie mozna rozpoczac zapisu video"
             )
         }
         writer.startSession(atSourceTime: .zero)
 
-        // Kanoniczny pipeline AVAssetWriter: kazdy input ma pompe
-        // requestMediaDataWhenReady na wlasnej kolejce, karmiona z
-        // blokujacej kolejki probek (backpressure). Polling
-        // isReadyForMoreMediaData bez pompy zawiesza sie na stale.
-        let videoFeed = SampleFeed(capacity: 360)
-        let audioFeed = SampleFeed(capacity: 360)
+        let feed = SampleFeed(capacity: 360)
         let errorBox = ErrorBox()
-        let pumpsDone = DispatchSemaphore(value: 0)
-        var pumpCount = 1
-
-        Self.pump(
-            input: videoInput,
-            feed: videoFeed,
-            label: "video",
-            writer: writer,
-            errorBox: errorBox,
-            done: pumpsDone
-        )
-        if let audioInput {
-            pumpCount += 1
-            Self.pump(
-                input: audioInput,
-                feed: audioFeed,
-                label: "audio",
-                writer: writer,
-                errorBox: errorBox,
-                done: pumpsDone
-            )
-        }
+        let done = DispatchSemaphore(value: 0)
+        Self.pump(input: input, feed: feed, label: "video", writer: writer, errorBox: errorBox, done: done)
 
         func fail(_ message: String) -> MediaError {
-            videoFeed.finish()
-            audioFeed.finish()
-            // Daj pompom zejsc, zanim anulujemy writer — markAsFinished
-            // po cancelWriting potrafi rzucic wyjatkiem Objective-C.
-            for _ in 0..<pumpCount {
-                _ = pumpsDone.wait(timeout: .now() + 2)
-            }
+            feed.finish()
+            _ = done.wait(timeout: .now() + 3)
             writer.cancelWriting()
             return MediaError.invalidExport(message)
         }
 
-        let clipLimit = CMTime(seconds: clipDuration, preferredTimescale: 600)
+        var clipVideoEnds: [CMTime] = []
         var videoCursor = CMTime.zero
-        var audioCursor = CMTime.zero
         var lastVideoDTS = CMTime.invalid
 
         for (index, segment) in segments.enumerated() {
@@ -501,32 +526,26 @@ final class MontageRenderer: @unchecked Sendable {
                 _ = fail("przerwane")
                 throw MediaError.cancelled
             }
+            if let message = errorBox.message {
+                throw fail(message)
+            }
             onProgress(
                 RenderProgress(
-                    stage: "Sklejanie \(index + 1)/\(segments.count)",
-                    fraction: 0.85 + 0.10 * Double(index) / Double(segments.count)
+                    stage: "Sklejanie video \(index + 1)/\(segments.count)",
+                    fraction: 0.85 + 0.08 * Double(index) / Double(segments.count)
                 )
             )
 
             let asset = AVURLAsset(url: segment)
-            guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            guard let track = asset.tracks(withMediaType: .video).first else {
                 throw fail("brak video w \(segment.lastPathComponent)")
             }
             guard let reader = try? AVAssetReader(asset: asset) else {
                 throw fail("nie mozna czytac \(segment.lastPathComponent)")
             }
-
-            let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
-            videoOutput.alwaysCopiesSampleData = false
-            reader.add(videoOutput)
-
-            var audioOutput: AVAssetReaderTrackOutput?
-            if includeAudio, let audioTrack = asset.tracks(withMediaType: .audio).first {
-                let out = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-                out.alwaysCopiesSampleData = false
-                reader.add(out)
-                audioOutput = out
-            }
+            let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            readerOutput.alwaysCopiesSampleData = false
+            reader.add(readerOutput)
             guard reader.startReading() else {
                 throw fail(
                     "blad czytania \(segment.lastPathComponent): "
@@ -534,10 +553,9 @@ final class MontageRenderer: @unchecked Sendable {
                 )
             }
 
-            // --- VIDEO: czytaj, przestempluj i wrzucaj do pompy writera.
             var clipFirstPTS = CMTime.invalid
-            var clipVideoEnd = CMTime.zero  // koniec klipu w osi klipu (od 0)
-            while let sample = videoOutput.copyNextSampleBuffer() {
+            var clipVideoEnd = CMTime.zero
+            while let sample = readerOutput.copyNextSampleBuffer() {
                 if isCancelled {
                     reader.cancelReading()
                     _ = fail("przerwane")
@@ -564,96 +582,26 @@ final class MontageRenderer: @unchecked Sendable {
                 lastVideoDTS = CMSampleBufferGetDecodeTimeStamp(retimed).isValid
                     ? CMSampleBufferGetDecodeTimeStamp(retimed)
                     : CMSampleBufferGetPresentationTimeStamp(retimed)
-                videoFeed.push(retimed)
+                feed.push(retimed)
 
                 var duration = CMSampleBufferGetDuration(sample)
                 if !duration.isValid || duration == .zero {
-                    duration = CMTime(value: 1, timescale: videoTrack.naturalTimeScale)
+                    duration = CMTime(value: 1, timescale: track.naturalTimeScale)
                 }
                 clipVideoEnd = CMTimeAdd(rel, duration)
             }
-
-            let clipVideoEndGlobal = CMTimeAdd(videoCursor, clipVideoEnd)
-
-            // --- AUDIO: pakiety CIAGLE (bez dziur), adaptacyjnie dobierana
-            // liczba, by globalnie |audio - video| <= ~1 pakiet AAC.
-            if let audioOutput {
-                // Pozycyjnie wg ZRODLOWYCH pts (odporne na bufory z zepsutym
-                // duration): pakiet wchodzi tylko, gdy jego pozycja wzgledem
-                // pierwszego pts miesci sie w budzecie klipu. Budzet = koniec
-                // video minus kursor audio, wiec drift nigdy sie nie kumuluje.
-                // Delta liczona RAZ na klip — per bufor podwajalaby przesuniecie.
-                let clipAudioStart = audioCursor
-                let budget = CMTimeSubtract(clipVideoEndGlobal, clipAudioStart)
-                var clipAudioDelta = CMTime.invalid
-                var clipFirstAudioPTS = CMTime.invalid
-                var lastEnd = CMTime.zero  // koniec audio w osi klipu
-                while let sample = audioOutput.copyNextSampleBuffer() {
-                    if isCancelled {
-                        reader.cancelReading()
-                        _ = fail("przerwane")
-                        throw MediaError.cancelled
-                    }
-                    if let message = errorBox.message {
-                        reader.cancelReading()
-                        throw fail(message)
-                    }
-                    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-                    if !clipFirstAudioPTS.isValid {
-                        clipFirstAudioPTS = pts
-                        clipAudioDelta = CMTimeSubtract(clipAudioStart, pts)
-                    }
-                    let rel = CMTimeSubtract(pts, clipFirstAudioPTS)
-                    // Pakiety sprzed startu albo poza budzetem — pomijamy.
-                    if rel.seconds < 0 {
-                        continue
-                    }
-                    if CMTimeCompare(rel, budget) >= 0 {
-                        break
-                    }
-                    var duration = CMSampleBufferGetDuration(sample)
-                    if !duration.isValid || duration == .zero {
-                        // Typowy pakiet AAC jako bezpieczne przyblizenie.
-                        duration = CMTime(value: 1024, timescale: 48000)
-                    }
-                    let end = CMTimeAdd(rel, duration)
-                    if CMTimeSubtract(end, budget).seconds > 0.012 {
-                        break
-                    }
-                    guard let retimed = Self.retimed(sample, by: clipAudioDelta, clampDTSAfter: .invalid) else {
-                        reader.cancelReading()
-                        throw fail("retiming audio w \(segment.lastPathComponent)")
-                    }
-                    audioFeed.push(retimed)
-                    if CMTimeCompare(end, lastEnd) > 0 {
-                        lastEnd = end
-                    }
-                }
-                audioCursor = CMTimeAdd(clipAudioStart, lastEnd)
-            }
-
             reader.cancelReading()
-            videoCursor = clipVideoEndGlobal
+
+            videoCursor = CMTimeAdd(videoCursor, clipVideoEnd)
+            clipVideoEnds.append(videoCursor)
         }
 
-        // Koniec strumieni: pompy dokoncza kolejki i oznacza inputy.
-        videoFeed.finish()
-        audioFeed.finish()
-        for _ in 0..<pumpCount {
-            while pumpsDone.wait(timeout: .now() + 0.25) == .timedOut {
-                if isCancelled {
-                    writer.cancelWriting()
-                    throw MediaError.cancelled
-                }
-                if let message = errorBox.message {
-                    writer.cancelWriting()
-                    throw MediaError.invalidExport(message)
-                }
+        feed.finish()
+        while done.wait(timeout: .now() + 0.25) == .timedOut {
+            if isCancelled {
+                writer.cancelWriting()
+                throw MediaError.cancelled
             }
-        }
-        if isCancelled {
-            writer.cancelWriting()
-            throw MediaError.cancelled
         }
         if let message = errorBox.message {
             writer.cancelWriting()
@@ -661,14 +609,351 @@ final class MontageRenderer: @unchecked Sendable {
         }
 
         let finished = DispatchSemaphore(value: 0)
-        writer.finishWriting {
-            finished.signal()
-        }
+        writer.finishWriting { finished.signal() }
         finished.wait()
-
         guard writer.status == .completed else {
             throw MediaError.invalidExport(
-                writer.error?.localizedDescription ?? "zapis nie powiodl sie"
+                writer.error?.localizedDescription ?? "zapis video nie powiodl sie"
+            )
+        }
+        return clipVideoEnds
+    }
+
+    /// Zapisuje sciezke audio jako JEDEN jednolity strumien AAC: dekoduje
+    /// zrodla do PCM i koduje raz. Kopiowanie pakietow AAC bit-w-bit jest
+    /// zawodne w praktyce (bufory z zepsutym duration, przeskoki pts,
+    /// rozne opisy formatu miedzy klipami -> writer wstawia edit-listy
+    /// z dziurami, o ktore wywracaja sie playery). Dekodowanie + enkodowanie
+    /// 256k AAC jest niesluszalne, a obraz pozostaje bit-exact.
+    ///
+    /// Kazdy klip jest dopasowany do konca SWOJEGO video co do sampla:
+    /// nadmiar audio przycinamy, niedobor uzupelniamy cisza — synchronizacja
+    /// A/V jest dokladna i nigdy sie nie kumuluje.
+    private func writeAudioTrack(
+        segments: [URL],
+        clipVideoEnds: [CMTime],
+        to output: URL
+    ) throws {
+        let sampleRate = 48000
+        let channels = 2
+
+        let writer = try AVAssetWriter(outputURL: output, fileType: .mov)
+        var stereoLayout = AudioChannelLayout()
+        stereoLayout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+        let layoutData = Data(bytes: &stereoLayout, count: MemoryLayout<AudioChannelLayout>.size)
+        let input = AVAssetWriterInput(
+            mediaType: .audio,
+            outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: sampleRate,
+                AVNumberOfChannelsKey: channels,
+                AVEncoderBitRateKey: 256_000,
+                AVChannelLayoutKey: layoutData
+            ]
+        )
+        input.expectsMediaDataInRealTime = false
+        writer.add(input)
+        guard writer.startWriting() else {
+            throw MediaError.invalidExport(
+                writer.error?.localizedDescription ?? "nie mozna rozpoczac zapisu audio"
+            )
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        let feed = SampleFeed(capacity: 2000)
+        let errorBox = ErrorBox()
+        let done = DispatchSemaphore(value: 0)
+        Self.pump(input: input, feed: feed, label: "audio", writer: writer, errorBox: errorBox, done: done)
+
+        func fail(_ message: String) -> MediaError {
+            feed.finish()
+            _ = done.wait(timeout: .now() + 3)
+            writer.cancelWriting()
+            return MediaError.invalidExport(message)
+        }
+
+        // Wspolny format PCM: float32 interleaved stereo 48 kHz.
+        let pcmSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: channels
+        ]
+        guard let pcmFormat = Self.makePCMFormat(sampleRate: sampleRate, channels: channels) else {
+            throw fail("nie mozna utworzyc formatu PCM")
+        }
+
+        var cursorSamples: Int64 = 0  // pozycja w samplach 48 kHz
+
+        for (index, segment) in segments.enumerated() {
+            if isCancelled {
+                _ = fail("przerwane")
+                throw MediaError.cancelled
+            }
+            if let message = errorBox.message {
+                throw fail(message)
+            }
+            // Cel: audio konczy sie dokladnie na koncu video tego klipu.
+            let targetSamples = Int64((clipVideoEnds[index].seconds * Double(sampleRate)).rounded())
+
+            let asset = AVURLAsset(url: segment)
+            if let track = asset.tracks(withMediaType: .audio).first,
+               let reader = try? AVAssetReader(asset: asset) {
+                let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: pcmSettings)
+                readerOutput.alwaysCopiesSampleData = false
+                reader.add(readerOutput)
+                if reader.startReading() {
+                    while cursorSamples < targetSamples,
+                          let sample = readerOutput.copyNextSampleBuffer() {
+                        if isCancelled {
+                            reader.cancelReading()
+                            _ = fail("przerwane")
+                            throw MediaError.cancelled
+                        }
+                        if let message = errorBox.message {
+                            reader.cancelReading()
+                            throw fail(message)
+                        }
+                        var frames = Int64(CMSampleBufferGetNumSamples(sample))
+                        guard frames > 0 else {
+                            continue
+                        }
+                        var toAppend = sample
+                        if cursorSamples + frames > targetSamples {
+                            // Przytnij ostatni bufor co do sampla.
+                            let keep = targetSamples - cursorSamples
+                            var trimmed: CMSampleBuffer?
+                            CMSampleBufferCopySampleBufferForRange(
+                                allocator: kCFAllocatorDefault,
+                                sampleBuffer: sample,
+                                sampleRange: CFRange(location: 0, length: CFIndex(keep)),
+                                sampleBufferOut: &trimmed
+                            )
+                            guard let trimmed else {
+                                break
+                            }
+                            toAppend = trimmed
+                            frames = keep
+                        }
+                        guard let retimed = Self.retimedPCM(
+                            toAppend,
+                            atSample: cursorSamples,
+                            sampleRate: sampleRate
+                        ) else {
+                            reader.cancelReading()
+                            throw fail("retiming audio w \(segment.lastPathComponent)")
+                        }
+                        feed.push(retimed)
+                        cursorSamples += frames
+                    }
+                    reader.cancelReading()
+                }
+            }
+
+            // Niedobor uzupelnij cisza — klip konczy sie rowno z video.
+            if cursorSamples < targetSamples {
+                let missing = targetSamples - cursorSamples
+                guard let silence = Self.makeSilence(
+                    frames: missing,
+                    atSample: cursorSamples,
+                    format: pcmFormat,
+                    sampleRate: sampleRate,
+                    channels: channels
+                ) else {
+                    throw fail("nie mozna utworzyc ciszy")
+                }
+                feed.push(silence)
+                cursorSamples = targetSamples
+            }
+        }
+
+        feed.finish()
+        while done.wait(timeout: .now() + 0.25) == .timedOut {
+            if isCancelled {
+                writer.cancelWriting()
+                throw MediaError.cancelled
+            }
+        }
+        if let message = errorBox.message {
+            writer.cancelWriting()
+            throw MediaError.invalidExport(message)
+        }
+
+        let finished = DispatchSemaphore(value: 0)
+        writer.finishWriting { finished.signal() }
+        finished.wait()
+        guard writer.status == .completed else {
+            throw MediaError.invalidExport(
+                writer.error?.localizedDescription ?? "zapis audio nie powiodl sie"
+            )
+        }
+    }
+
+    private static func makePCMFormat(sampleRate: Int, channels: Int) -> CMAudioFormatDescription? {
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: Float64(sampleRate),
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(4 * channels),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(4 * channels),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+        var format: CMAudioFormatDescription?
+        CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            asbd: &asbd,
+            layoutSize: MemoryLayout<AudioChannelLayout>.size,
+            layout: &layout,
+            magicCookieSize: 0,
+            magicCookie: nil,
+            extensions: nil,
+            formatDescriptionOut: &format
+        )
+        return format
+    }
+
+    /// Bufor PCM przestemplowany na pozycje `atSample` (contiguous timeline).
+    private static func retimedPCM(
+        _ sample: CMSampleBuffer,
+        atSample position: Int64,
+        sampleRate: Int
+    ) -> CMSampleBuffer? {
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: CMTimeScale(sampleRate)),
+            presentationTimeStamp: CMTime(value: position, timescale: CMTimeScale(sampleRate)),
+            decodeTimeStamp: .invalid
+        )
+        var result: CMSampleBuffer?
+        CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: sample,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleBufferOut: &result
+        )
+        if let result {
+            CMRemoveAttachment(result, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
+            CMRemoveAttachment(result, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd)
+        }
+        return result
+    }
+
+    /// Cichy bufor PCM o zadanej liczbie sampli.
+    private static func makeSilence(
+        frames: Int64,
+        atSample position: Int64,
+        format: CMAudioFormatDescription,
+        sampleRate: Int,
+        channels: Int
+    ) -> CMSampleBuffer? {
+        let bytesPerFrame = 4 * channels
+        let length = Int(frames) * bytesPerFrame
+        var blockBuffer: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: length,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: length,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        ) == noErr, let blockBuffer else {
+            return nil
+        }
+        CMBlockBufferFillDataBytes(
+            with: 0,
+            blockBuffer: blockBuffer,
+            offsetIntoDestination: 0,
+            dataLength: length
+        )
+
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: CMTimeScale(sampleRate)),
+            presentationTimeStamp: CMTime(value: position, timescale: CMTimeScale(sampleRate)),
+            decodeTimeStamp: .invalid
+        )
+        var result: CMSampleBuffer?
+        CMSampleBufferCreate(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: blockBuffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: format,
+            sampleCount: CMItemCount(frames),
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 0,
+            sampleSizeArray: nil,
+            sampleBufferOut: &result
+        )
+        return result
+    }
+
+    /// Laczy gotowa sciezke video i audio w jeden plik (passthrough).
+    /// Po jednym segmencie na sciezke — nic nie moze sie zdublowac.
+    private func mergeTracks(videoURL: URL, audioURL: URL?, to output: URL) throws {
+        if FileManager.default.fileExists(atPath: output.path) {
+            try FileManager.default.removeItem(at: output)
+        }
+
+        let composition = AVMutableComposition()
+        let videoAsset = AVURLAsset(url: videoURL)
+        guard let sourceVideo = videoAsset.tracks(withMediaType: .video).first,
+              let videoTrack = composition.addMutableTrack(
+                  withMediaType: .video,
+                  preferredTrackID: kCMPersistentTrackID_Invalid
+              ) else {
+            throw MediaError.invalidExport("brak sciezki video do zlaczenia")
+        }
+        try videoTrack.insertTimeRange(sourceVideo.timeRange, of: sourceVideo, at: .zero)
+
+        if let audioURL {
+            let audioAsset = AVURLAsset(url: audioURL)
+            if let sourceAudio = audioAsset.tracks(withMediaType: .audio).first,
+               let audioTrack = composition.addMutableTrack(
+                   withMediaType: .audio,
+                   preferredTrackID: kCMPersistentTrackID_Invalid
+               ) {
+                try audioTrack.insertTimeRange(sourceAudio.timeRange, of: sourceAudio, at: .zero)
+            }
+        }
+
+        guard let export = AVAssetExportSession(
+            asset: composition,
+            presetName: AVAssetExportPresetPassthrough
+        ) else {
+            throw MediaError.invalidExport("passthrough eksport niedostepny")
+        }
+        export.outputURL = output
+        export.outputFileType = .mov
+
+        let semaphore = DispatchSemaphore(value: 0)
+        export.exportAsynchronously { semaphore.signal() }
+        while semaphore.wait(timeout: .now() + 0.25) == .timedOut {
+            if isCancelled {
+                export.cancelExport()
+            }
+        }
+
+        switch export.status {
+        case .completed:
+            return
+        case .cancelled:
+            throw MediaError.cancelled
+        default:
+            throw MediaError.invalidExport(
+                export.error?.localizedDescription ?? "laczenie sciezek nie powiodlo sie"
             )
         }
     }
@@ -770,6 +1055,77 @@ final class MontageRenderer: @unchecked Sendable {
         }
     }
 
+    /// Kopia bufora audio z pakietami ULOZONYMI SCISLE OD `start`, pakiet po
+    /// pakiecie wg ich czasow trwania — kasuje wewnetrzne przeskoki pts
+    /// zrodla (writer robilby z nich edit-listy/dziury). Zwraca tez laczny
+    /// czas medium bufora (do przesuwania kursora).
+    private static func retimedContiguousAudio(
+        _ sample: CMSampleBuffer,
+        at start: CMTime
+    ) -> (buffer: CMSampleBuffer, mediaDuration: CMTime)? {
+        var count = 0
+        let queryStatus = CMSampleBufferGetSampleTimingInfoArray(
+            sample,
+            entryCount: 0,
+            arrayToFill: nil,
+            entriesNeededOut: &count
+        )
+
+        var infos: [CMSampleTimingInfo]
+        if queryStatus == noErr, count > 0 {
+            infos = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+            guard CMSampleBufferGetSampleTimingInfoArray(
+                sample,
+                entryCount: count,
+                arrayToFill: &infos,
+                entriesNeededOut: nil
+            ) == noErr else {
+                return nil
+            }
+        } else {
+            let sampleCount = max(1, CMSampleBufferGetNumSamples(sample))
+            let total = CMSampleBufferGetDuration(sample)
+            let perSample = total.isValid && total.value > 0
+                ? CMTimeMultiplyByRatio(total, multiplier: 1, divisor: Int32(sampleCount))
+                : CMTime(value: 1024, timescale: 48000)
+            infos = [
+                CMSampleTimingInfo(
+                    duration: perSample,
+                    presentationTimeStamp: start,
+                    decodeTimeStamp: .invalid
+                )
+            ]
+        }
+
+        var running = start
+        for index in infos.indices {
+            var duration = infos[index].duration
+            if !duration.isValid || duration.value <= 0 {
+                duration = CMTime(value: 1024, timescale: 48000)
+                infos[index].duration = duration
+            }
+            infos[index].presentationTimeStamp = running
+            infos[index].decodeTimeStamp = .invalid
+            running = CMTimeAdd(running, duration)
+        }
+
+        var result: CMSampleBuffer?
+        CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: sample,
+            sampleTimingEntryCount: infos.count,
+            sampleTimingArray: &infos,
+            sampleBufferOut: &result
+        )
+        guard let result else {
+            return nil
+        }
+        // Trim (priming AAC) honorowany per klip robilby dziure na granicy.
+        CMRemoveAttachment(result, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
+        CMRemoveAttachment(result, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd)
+        return (result, CMTimeSubtract(running, start))
+    }
+
     /// Kopia probki z czasami przesunietymi o delte. DTS jest dodatkowo
     /// pilnowany, by byl scisle rosnacy (wymog muxera).
     private static func retimed(
@@ -844,6 +1200,12 @@ final class MontageRenderer: @unchecked Sendable {
             sampleTimingArray: &infos,
             sampleBufferOut: &result
         )
+        if let result {
+            // Pierwsze pakiety AAC kazdego klipu niosa trim (priming ~21 ms);
+            // honorowany per klip robilby dziure na kazdej granicy.
+            CMRemoveAttachment(result, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
+            CMRemoveAttachment(result, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd)
+        }
         return result
     }
 
