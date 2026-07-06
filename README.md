@@ -68,6 +68,14 @@ Po naprawie folder skleja sie czysto w kazdym trybie.
      parametrow wszystkich klipow (kodek, rozdzielczosc, kolor) — aplikacja
      sprawdza to przed renderem i po renderze weryfikuje dekodowanie. Przy
      problemach uzyj `ProRes HQ` albo `H.264`.
+
+   UWAGA (tryby bezstratne): gdy w folderze sa klipy z roznych enkoderow
+   (np. naprawione klipy x265 wsrod nagran z iPhone'a), wynik ma wiecej niz
+   jeden opis formatu w sciezce (multi-stsd). To poprawna struktura QuickTime
+   — ffmpeg, VLC i silnik IINA graja ja idealnie — ale sama aplikacja
+   QuickTime Player potrafi pokazac blednie czas i zwolnic odtwarzanie.
+   Bezstratny plik traktuj jako archiwum i ogladaj w IINA/VLC; do ogladania
+   w swiecie Apple i udostepniania renderuj `H.264`.
 6. `Renderuj film`: kazdy klip jest przycinany do ustawionej dlugosci,
    normalizacja klipow → napisy → concat → muzyka → walidacja, z paskiem
    postepu i mozliwoscia przerwania.
