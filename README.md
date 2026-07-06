@@ -47,14 +47,20 @@ Po naprawie folder skleja sie czysto w kazdym trybie.
 1. Wybierz folder z wycietymi sekundami (podpowiadany jest folder eksportu).
 2. Klipy sortuja sie chronologicznie po dacie z nazwy pliku; checkbox
    wlacza/wylacza klip, kolejnosc zmieniasz przeciaganiem.
-3. Podglad moze odtwarzac pojedynczy klip albo caly film z aktualna kolejnoscia
-   i podgladowym napisem daty.
-4. Opcje: dokladna dlugosc klipu (domyslnie 1.00 s), plansza tytulowa i
-   koncowa, **napis z data z nazwy pliku** w wielu formatach, wybor fontu,
+3. Podglad moze odtwarzac pojedynczy klip albo caly film — ten drugi jako
+   przewijalna kompozycja bez renderowania (suwak dziala jak w gotowym pliku,
+   napis daty podaza za czasem).
+4. Opcje: dokladna dlugosc klipu (domyslnie 1.00 s), opcjonalna normalizacja
+   glosnosci klipow (EBU R128, -16 LUFS — koncert obok szeptu przestaje
+   strzelac glosnoscia), plansza tytulowa i koncowa, **napis z data z nazwy pliku** w wielu formatach, wybor fontu,
    muzyka z regulacja glosnosci i fade-out, zachowanie dzwieku klipow,
    rozdzielczosc (4K/1080p/720p/kwadrat/pion) i fps.
 5. Tryby renderu:
-   - `H.264`: uniwersalny MP4, obraz jest renderowany ponownie;
+   - `Premium HDR` (zalecany do ogladania): HEVC 10-bit z zachowanym HDR
+     (HLG/BT.2020) i wysokim bitrate — jakosc wizualnie jak oryginal
+     z iPhone'a, z napisami, planszami i muzyka; jeden format w sciezce,
+     wiec gra wszedzie (QuickTime, TV, AirPlay);
+   - `H.264`: uniwersalny MP4 (SDR 8-bit), obraz jest renderowany ponownie;
    - `ProRes HQ`: bardzo wysoka jakosc do archiwum lub dalszego montazu,
      z napisami, planszami i muzyka;
    - `Bezstratnie smart`: klipy zgodne z najczestsza sygnatura (kodek,
@@ -75,7 +81,7 @@ Po naprawie folder skleja sie czysto w kazdym trybie.
    — ffmpeg, VLC i silnik IINA graja ja idealnie — ale sama aplikacja
    QuickTime Player potrafi pokazac blednie czas i zwolnic odtwarzanie.
    Bezstratny plik traktuj jako archiwum i ogladaj w IINA/VLC; do ogladania
-   w swiecie Apple i udostepniania renderuj `H.264`.
+   w swiecie Apple i udostepniania renderuj `Premium HDR`.
 6. `Renderuj film`: kazdy klip jest przycinany do ustawionej dlugosci,
    normalizacja klipow → napisy → concat → muzyka → walidacja, z paskiem
    postepu i mozliwoscia przerwania.

@@ -43,6 +43,8 @@ final class MontageModel: ObservableObject {
     /// Podglad wybranego klipu odtwarzany w petli.
     let previewPlayer = AVQueuePlayer()
     private var previewLooper: AVPlayerLooper?
+    /// Granice klipow w podgladzie calego filmu: (koniec [s], napis).
+    private var previewBoundaries: [(end: Double, caption: String)] = []
     private var previewTimeObserver: Any?
 
     private let tools: ToolSet
@@ -285,13 +287,76 @@ final class MontageModel: ObservableObject {
         previewLooper = nil
         removePreviewObserver()
         previewPlayer.removeAllItems()
-        for clip in included {
-            previewPlayer.insert(AVPlayerItem(url: clip.url), after: nil)
+        statusMessage = "Skladam podglad calego filmu..."
+
+        // Kompozycja calego filmu bez renderowania: jedna PRZEWIJALNA os
+        // czasu (suwak playera dziala jak w gotowym pliku), z aktualna
+        // kolejnoscia, wykluczeniami i dlugoscia klipu.
+        let payload = included.map { (url: $0.url, caption: formattedCaption(for: $0)) }
+        let limitSeconds = min(10.0, max(0.1, settings.clipDuration))
+        Task { [weak self] in
+            let built = await Task.detached(priority: .userInitiated) {
+                () -> (AVMutableComposition, [(end: Double, caption: String)]) in
+                let composition = AVMutableComposition()
+                let videoTrack = composition.addMutableTrack(
+                    withMediaType: .video,
+                    preferredTrackID: kCMPersistentTrackID_Invalid
+                )
+                let audioTrack = composition.addMutableTrack(
+                    withMediaType: .audio,
+                    preferredTrackID: kCMPersistentTrackID_Invalid
+                )
+                let limit = CMTime(seconds: limitSeconds, preferredTimescale: 600)
+                var boundaries: [(end: Double, caption: String)] = []
+                var cursor = CMTime.zero
+                for clip in payload {
+                    let asset = AVURLAsset(url: clip.url)
+                    guard let source = asset.tracks(withMediaType: .video).first,
+                          let videoTrack else {
+                        continue
+                    }
+                    let duration = CMTimeMinimum(source.timeRange.duration, limit)
+                    let segmentStart = cursor
+                    try? videoTrack.insertTimeRange(
+                        CMTimeRange(start: source.timeRange.start, duration: duration),
+                        of: source,
+                        at: cursor
+                    )
+                    // Faktyczny koniec sciezki — bez pustych editow (dziur).
+                    cursor = videoTrack.timeRange.end
+                    if let audioTrack,
+                       let sourceAudio = asset.tracks(withMediaType: .audio).first {
+                        let audioDuration = CMTimeMinimum(
+                            sourceAudio.timeRange.duration,
+                            CMTimeSubtract(cursor, segmentStart)
+                        )
+                        try? audioTrack.insertTimeRange(
+                            CMTimeRange(start: sourceAudio.timeRange.start, duration: audioDuration),
+                            of: sourceAudio,
+                            at: segmentStart
+                        )
+                    }
+                    boundaries.append((cursor.seconds, clip.caption))
+                }
+                return (composition, boundaries)
+            }.value
+
+            guard let self, self.previewMode == .movie else {
+                return
+            }
+            self.previewBoundaries = built.1
+            self.previewPlayer.insert(AVPlayerItem(asset: built.0), after: nil)
+            self.previewCaption = built.1.first?.caption ?? ""
+            self.startPreviewObserver()
+            self.previewPlayer.play()
+            let total = built.1.last?.end ?? 0
+            self.statusMessage = String(
+                format: "Podglad calego filmu: %d klipow, %d:%02d — przewijaj suwakiem",
+                payload.count,
+                Int(total) / 60,
+                Int(total) % 60
+            )
         }
-        previewCaption = formattedCaption(for: included[0])
-        startPreviewObserver()
-        previewPlayer.play()
-        statusMessage = "Podglad calego filmu: \(included.count) klipow"
     }
 
     func restartPreview() {
@@ -517,15 +582,19 @@ final class MontageModel: ObservableObject {
         previewTimeObserver = previewPlayer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.2, preferredTimescale: 600),
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] time in
             Task { @MainActor [weak self] in
-                guard let self,
-                      self.previewMode == .movie,
-                      let currentURL = self.currentPreviewURL(),
-                      let clip = self.clips.first(where: { $0.url == currentURL }) else {
+                guard let self, self.previewMode == .movie else {
                     return
                 }
-                self.previewCaption = self.formattedCaption(for: clip)
+                let seconds = time.seconds
+                guard let entry = self.previewBoundaries.first(where: { seconds < $0.end })
+                    ?? self.previewBoundaries.last else {
+                    return
+                }
+                if self.previewCaption != entry.caption {
+                    self.previewCaption = entry.caption
+                }
             }
         }
     }
@@ -537,10 +606,4 @@ final class MontageModel: ObservableObject {
         }
     }
 
-    private func currentPreviewURL() -> URL? {
-        guard let asset = previewPlayer.currentItem?.asset as? AVURLAsset else {
-            return nil
-        }
-        return asset.url
-    }
 }

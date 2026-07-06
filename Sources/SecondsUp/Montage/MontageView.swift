@@ -407,6 +407,14 @@ struct MontageView: View {
                 }
             }
             .font(.callout)
+
+            if model.settings.keepClipAudio && !model.settings.renderMode.isLossless {
+                Toggle("Normalizuj glosnosc klipow (EBU R128)", isOn: $model.settings.normalizeLoudness)
+                    .font(.callout)
+                    .help("Wyrownuje poziom glosnosci miedzy klipami do -16 LUFS "
+                        + "(koncert obok szeptu przestaje strzelac glosnoscia). "
+                        + "Wydluza render o pomiar kazdego klipu.")
+            }
         }
     }
 

@@ -193,6 +193,7 @@ enum CaptionFont: String, Codable, CaseIterable, Identifiable {
 }
 
 enum MontageRenderMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case hdrPremium
     case h264
     case proResHQ
     case losslessSmart
@@ -202,6 +203,8 @@ enum MontageRenderMode: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var label: String {
         switch self {
+        case .hdrPremium:
+            return "Premium HDR"
         case .h264:
             return "H.264"
         case .proResHQ:
@@ -215,8 +218,13 @@ enum MontageRenderMode: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var help: String {
         switch self {
+        case .hdrPremium:
+            return "HEVC 10-bit z zachowanym HDR (HLG/BT.2020) i wysokim bitrate — "
+                + "jakosc wizualnie jak oryginal z iPhone'a, z napisami, planszami "
+                + "i muzyka. Jeden format w sciezce, wiec gra wszedzie (QuickTime, "
+                + "TV, AirPlay). Zalecany do ogladania."
         case .h264:
-            return "Uniwersalny plik MP4. Obraz jest renderowany ponownie."
+            return "Uniwersalny plik MP4. Obraz jest renderowany ponownie (SDR 8-bit)."
         case .proResHQ:
             return "Bardzo wysoka jakosc do archiwum lub dalszego montazu. Pliki beda duze."
         case .losslessSmart:
@@ -303,6 +311,9 @@ struct MontageSettings: Codable, Equatable {
     var musicFadeOut = true
     var musicFadeDuration = 2.0
     var keepClipAudio = false
+    /// Normalizacja glosnosci klipow do wspolnego poziomu (EBU R128, -16 LUFS).
+    /// Opcjonalna — dziala w trybach renderowanych (nie bezstratnych).
+    var normalizeLoudness = false
     var clipAudioVolume = 1.0
 
     var resolution: ResolutionPreset = .p1080
@@ -341,6 +352,7 @@ struct MontageSettings: Codable, Equatable {
         musicFadeOut = try container.decodeIfPresent(Bool.self, forKey: .musicFadeOut) ?? defaults.musicFadeOut
         musicFadeDuration = try container.decodeIfPresent(Double.self, forKey: .musicFadeDuration) ?? defaults.musicFadeDuration
         keepClipAudio = try container.decodeIfPresent(Bool.self, forKey: .keepClipAudio) ?? defaults.keepClipAudio
+        normalizeLoudness = try container.decodeIfPresent(Bool.self, forKey: .normalizeLoudness) ?? defaults.normalizeLoudness
         clipAudioVolume = try container.decodeIfPresent(Double.self, forKey: .clipAudioVolume) ?? defaults.clipAudioVolume
         resolution = try container.decodeIfPresent(ResolutionPreset.self, forKey: .resolution) ?? defaults.resolution
         fps = try container.decodeIfPresent(Int.self, forKey: .fps) ?? defaults.fps

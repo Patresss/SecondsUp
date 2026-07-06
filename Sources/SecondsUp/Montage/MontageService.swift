@@ -437,8 +437,26 @@ final class MontageRenderer: @unchecked Sendable {
             "setsar=1",
             "fps=\(settings.fps)"
         ]
+        if settings.renderMode == .hdrPremium {
+            // Zrodla spoza HLG (np. stare klipy SDR) konwertujemy do
+            // przestrzeni wyjscia, zeby kolory byly spojne w calym filmie.
+            if let signature = try? conformer.probeVideoSignature(of: source),
+               signature.colorTransfer != "arib-std-b67",
+               let zscale = ClipConformer.zscaleFilter(from: signature, to: Self.hlgTarget) {
+                filters.append(zscale)
+            }
+        }
         if settings.captionEnabled && !caption.isEmpty {
             filters.append(captionFilter(text: caption, settings: settings))
+        }
+        if settings.renderMode == .hdrPremium {
+            // Znakowanie klatek charakterystyka HLG — bez tego videotoolbox
+            // i concat gubia tagi kolorow (color_transfer=unknown).
+            filters.append(
+                "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc"
+            )
+            // 10 bitow do samego enkodera (videotoolbox przyjmuje p010).
+            filters.append("format=p010le")
         }
 
         var arguments = [
@@ -462,8 +480,21 @@ final class MontageRenderer: @unchecked Sendable {
         if settings.keepClipAudio {
             if hasAudio {
                 arguments += ["-map", "0:a:0"]
+                var audioFilters: [String] = []
+                if settings.normalizeLoudness {
+                    // EBU R128: dwuprzebiegowo, gdy udalo sie zmierzyc klip;
+                    // inaczej jednoprzebiegowo. loudnorm upsampluje do 192 kHz,
+                    // wiec wracamy do 48 kHz.
+                    audioFilters.append(
+                        loudnormFilter(ffmpegURL: ffmpegURL, source: source)
+                    )
+                    audioFilters.append("aresample=48000")
+                }
                 if abs(settings.clipAudioVolume - 1.0) > 0.01 {
-                    arguments += ["-af", String(format: "volume=%.2f", settings.clipAudioVolume)]
+                    audioFilters.append(String(format: "volume=%.2f", settings.clipAudioVolume))
+                }
+                if !audioFilters.isEmpty {
+                    arguments += ["-af", audioFilters.joined(separator: ",")]
                 }
             } else {
                 arguments += ["-map", "1:a:0", "-shortest"]
@@ -504,9 +535,14 @@ final class MontageRenderer: @unchecked Sendable {
         if settings.keepClipAudio {
             arguments += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
         }
+        var cardFilter = drawtext
+        if settings.renderMode == .hdrPremium {
+            cardFilter += ",setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc"
+            cardFilter += ",format=p010le"
+        }
         arguments += [
             "-t", String(format: "%.2f", duration),
-            "-vf", drawtext,
+            "-vf", cardFilter,
             "-map", "0:v"
         ]
         if settings.keepClipAudio {
@@ -538,6 +574,7 @@ final class MontageRenderer: @unchecked Sendable {
                 "-safe", "0",
                 "-i", listURL.path,
                 "-c", "copy",
+                "-movflags", "write_colr",
                 output.path
             ]
         )
@@ -584,6 +621,7 @@ final class MontageRenderer: @unchecked Sendable {
                 "-map", "0:v",
                 "-map", audioMap,
                 "-c:v", "copy",
+                "-movflags", "write_colr",
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-t", String(format: "%.3f", duration),
@@ -606,6 +644,20 @@ final class MontageRenderer: @unchecked Sendable {
 
     private func videoEncodingArguments(settings: MontageSettings) -> [String] {
         switch settings.renderMode {
+        case .hdrPremium:
+            // HEVC 10-bit z zachowanym HLG — jakosc wizualnie jak oryginal,
+            // hvc1 + jeden opis formatu, wiec QuickTime/TV graja bez zarzutu.
+            let (width, height) = settings.resolution.size
+            return [
+                "-c:v", "hevc_videotoolbox",
+                "-b:v", Self.premiumBitrate(width: width, height: height),
+                "-profile:v", "main10",
+                "-tag:v", "hvc1",
+                "-color_primaries", "bt2020",
+                "-color_trc", "arib-std-b67",
+                "-colorspace", "bt2020nc",
+                "-movflags", "write_colr"
+            ]
         case .h264, .losslessSmart, .losslessCopy:
             return [
                 "-c:v", "libx264",
@@ -620,6 +672,88 @@ final class MontageRenderer: @unchecked Sendable {
                 "-pix_fmt", "yuv422p10le"
             ]
         }
+    }
+
+    /// Docelowa charakterystyka kolorow Premium HDR (jak nagrania iPhone'a).
+    static let hlgTarget = ClipConformer.VideoSignature(
+        codec: "hevc",
+        width: 0,
+        height: 0,
+        pixelFormat: "yuv420p10le",
+        colorTransfer: "arib-std-b67",
+        colorPrimaries: "bt2020",
+        colorSpace: "bt2020nc",
+        fps: 0,
+        trackTimescale: 0,
+        startTime: 0
+    )
+
+    /// Filtr loudnorm: mierzy klip (pierwszy przebieg) i zwraca filtr
+    /// drugiego przebiegu; gdy pomiar sie nie uda — jednoprzebiegowy.
+    private func loudnormFilter(ffmpegURL: URL, source: URL) -> String {
+        let base = "loudnorm=I=-16:TP=-1.5:LRA=11"
+        guard let measured = try? measureLoudness(ffmpegURL: ffmpegURL, source: source) else {
+            return base
+        }
+        return base
+            + ":measured_I=\(measured.i)"
+            + ":measured_TP=\(measured.tp)"
+            + ":measured_LRA=\(measured.lra)"
+            + ":measured_thresh=\(measured.thresh)"
+            + ":offset=\(measured.offset)"
+            + ":linear=true"
+    }
+
+    private func measureLoudness(
+        ffmpegURL: URL,
+        source: URL
+    ) throws -> (i: String, tp: String, lra: String, thresh: String, offset: String) {
+        let process = Process()
+        process.executableURL = ffmpegURL
+        process.arguments = [
+            "-hide_banner",
+            "-nostdin",
+            "-i", source.path,
+            "-vn",
+            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+            "-f", "null",
+            "-"
+        ]
+        let errorPipe = Pipe()
+        process.standardOutput = Pipe()
+        process.standardError = errorPipe
+        try process.run()
+        let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        let text = String(data: data, encoding: .utf8) ?? ""
+        // JSON loudnorm to ostatni blok { ... } na stderr.
+        guard let open = text.range(of: "{", options: .backwards),
+              let close = text.range(of: "}", options: .backwards),
+              open.lowerBound < close.lowerBound,
+              let json = try? JSONSerialization.jsonObject(
+                  with: Data(text[open.lowerBound...close.lowerBound].utf8)
+              ) as? [String: Any],
+              let i = json["input_i"] as? String,
+              let tp = json["input_tp"] as? String,
+              let lra = json["input_lra"] as? String,
+              let thresh = json["input_thresh"] as? String,
+              let offset = json["target_offset"] as? String else {
+            throw MediaError.invalidJSON
+        }
+        return (i, tp, lra, thresh, offset)
+    }
+
+    /// Bitrate Premium HDR wg rozdzielczosci (HEVC 10-bit).
+    static func premiumBitrate(width: Int, height: Int) -> String {
+        let pixels = width * height
+        if pixels >= 3840 * 2160 * 9 / 10 {
+            return "70M"
+        }
+        if pixels >= 1920 * 1080 {
+            return "30M"
+        }
+        return "15M"
     }
 
     static func escapeDrawtext(_ text: String) -> String {
@@ -802,6 +936,6 @@ private extension MontageSettings {
     }
 
     var segmentExtension: String {
-        renderMode == .proResHQ ? "mov" : "mp4"
+        renderMode == .proResHQ || renderMode == .hdrPremium ? "mov" : "mp4"
     }
 }

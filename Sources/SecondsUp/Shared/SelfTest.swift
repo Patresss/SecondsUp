@@ -136,6 +136,13 @@ enum SelfTest {
                     settings.titleEnabled = false
                 }
             }
+            if arguments.contains("--keep-audio") {
+                settings.keepClipAudio = true
+            }
+            if arguments.contains("--normalize-loudness") {
+                settings.keepClipAudio = true
+                settings.normalizeLoudness = true
+            }
 
             var clips: [(url: URL, caption: String)] = []
             let contents = try FileManager.default.contentsOfDirectory(
